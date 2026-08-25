@@ -5,7 +5,7 @@ PowerShell endpoint geolocation that combines multiple signals instead of treati
 ## Quick start
 
 ```powershell
-./Get-DeviceCoords-v3.62.ps1 | Format-List *
+./Get-DeviceCoords.ps1 | Format-List *
 ```
 
 PowerShell 7 is recommended. Windows PowerShell 5.1 compatibility is retained.
@@ -30,7 +30,7 @@ Google Wi-Fi geolocation:
 
 ```powershell
 $env:GOOGLE_GEO_API_KEY = '<key>'
-./Get-DeviceCoords-v3.62.ps1
+./Get-DeviceCoords.ps1
 ```
 
 WiGLE:
@@ -38,13 +38,13 @@ WiGLE:
 ```powershell
 $env:WIGLE_API_NAME  = '<api-name>'
 $env:WIGLE_API_TOKEN = '<api-token>'
-./Get-DeviceCoords-v3.62.ps1
+./Get-DeviceCoords.ps1
 ```
 
 Bluetooth LE scan:
 
 ```powershell
-./Get-DeviceCoords-v3.62.ps1 -BluetoothScanSeconds 10
+./Get-DeviceCoords.ps1 -BluetoothScanSeconds 10
 ```
 
 Optional Wi-Fi site map CSV format:
@@ -63,7 +63,7 @@ BSSID,Latitude,Longitude,Site,AccuracyMeters
 ## Repository contents
 
 ```text
-Get-DeviceCoords-v3.62.ps1
+Get-DeviceCoords.ps1
 README.md
 LICENSE
 ```
