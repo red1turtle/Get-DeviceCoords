@@ -6,7 +6,7 @@ Endpoint geolocation scripts. The current PowerShell script and Bash companion c
 
 | Script | Platforms | Purpose |
 | --- | --- | --- |
-| `Get-DeviceCoords-v3.65.1.ps1` | Windows, Linux, macOS | Current PowerShell workflow with multiple location resolvers and network evidence. PowerShell 7 is recommended; Windows PowerShell 5.1 compatibility is retained. |
+| `Get-DeviceCoords-v3.65.3.ps1` | Windows, Linux, macOS | Current PowerShell workflow with multiple location resolvers and network evidence. PowerShell 7 is recommended; Windows PowerShell 5.1 compatibility is retained. |
 | `get-device-coords-v2.6.sh` | Linux, macOS | Standalone Bash 3.2+ companion aligned with the v3.62 feature contract. It does not require PowerShell, Python, or jq. |
 | `Get-DeviceCoords-v1.0.ps1` | Windows only | Legacy Windows registry and `GeoCoordinateWatcher` workflow. Requires Windows PowerShell 5.1 with the .NET Framework `System.Device` assembly. |
 
@@ -15,7 +15,7 @@ Endpoint geolocation scripts. The current PowerShell script and Bash companion c
 From the repository directory, run the current PowerShell script:
 
 ```powershell
-./Get-DeviceCoords-v3.65.1.ps1 | Format-List *
+./Get-DeviceCoords-v3.65.3.ps1 | Format-List *
 ```
 
 Or use the Bash companion on Linux/macOS:
@@ -47,7 +47,7 @@ Google Wi-Fi geolocation:
 
 ```powershell
 $env:GOOGLE_GEO_API_KEY = '<key>'
-./Get-DeviceCoords-v3.65.1.ps1
+./Get-DeviceCoords-v3.65.3.ps1
 ```
 
 WiGLE:
@@ -55,13 +55,13 @@ WiGLE:
 ```powershell
 $env:WIGLE_API_NAME  = '<api-name>'
 $env:WIGLE_API_TOKEN = '<api-token>'
-./Get-DeviceCoords-v3.65.1.ps1
+./Get-DeviceCoords-v3.65.3.ps1
 ```
 
 Bluetooth LE scan:
 
 ```powershell
-./Get-DeviceCoords-v3.65.1.ps1 -BluetoothScanSeconds 10
+./Get-DeviceCoords-v3.65.3.ps1 -BluetoothScanSeconds 10
 ```
 
 The current PowerShell script caps normal output at 20 Wi-Fi evidence rows and 15 Bluetooth evidence rows. Use `-FullEvidence` to show all rows, or `-Verbose` for diagnostics; resolvers still use the complete collected evidence set.
@@ -127,7 +127,7 @@ Use the quick-start commands for live validation. `-SkipPublicIpLookup -SkipBlue
 ## Repository contents
 
 ```text
-Get-DeviceCoords-v3.65.1.ps1
+Get-DeviceCoords-v3.65.3.ps1
 Get-DeviceCoords-v1.0.ps1
 get-device-coords-v2.6.sh
 README.md
