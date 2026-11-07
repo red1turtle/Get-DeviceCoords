@@ -1,17 +1,36 @@
 #create the HKU psdrive
-New-PSDrive -Name HKU -PSProvider Registry -Root HKEY_USERS -Scope Global -ErrorAction SilentlyContinue| out-null
+function Test-Administrator {
+    $user = [Security.Principal.WindowsIdentity]::GetCurrent()
+    return (New-Object Security.Principal.WindowsPrincipal $user).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
 
 try{
+    #check if admin and flipping "Device Location Consent"
+    $sys_loc = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\location"
+    if(Test-Administrator -and (Get-ItemProperty $sys_loc -Name Value).value -ne "Allow"){
+        $exe = "$env:WINDIR\System32\SystemSettingsAdminFlows.exe"
+
+        if (-not (Test-Path -LiteralPath $exe)) {
+            throw "Windows location control executable not found: $exe"
+        }
+
+        & $exe SetCamSystemGlobal location 1
+        #0 is no
+    }
+
+    if(!(test-path HKU:\)){New-PSDrive -Name HKU -PSProvider Registry -Root HKEY_USERS -Scope Global -ErrorAction Stop | out-null}
+
     #find user session keys
-    $sid_sessions = (ls HKU:\ -ErrorAction Stop | ? {$_.name -match "S-1-5-21-" -and $_.name -notmatch "classes"}).name
+    $sid_sessions = (ls HKU:\ -ErrorAction SilentlyContinue | ? {$_.name -match "S-1-5-21-|S-1-12-1-" -and $_.name -notmatch "classes"}).name
 
     foreach($sid in $sid_sessions){
         #flip the location services nipple to green
         $LocationPath = "HKU:\$($sid)\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\location"
-        Set-ItemProperty -Path $LocationPath -Name Value -Value Allow
+        Set-ItemProperty -Path $LocationPath -Name Value -Value Allow -ErrorAction Stop
     }
 }
 catch{
+
     #didn't work
     [pscustomobject]@{
         SID     = $sid
@@ -21,7 +40,6 @@ catch{
         Error   = $_.Exception.Message
     }
 }
-
 
 Add-Type -AssemblyName System.Device
 
