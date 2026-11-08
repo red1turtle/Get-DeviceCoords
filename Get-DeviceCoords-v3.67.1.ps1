@@ -46,6 +46,30 @@
     Maximum number of live WiGLE BSSID requests in one execution. Default: 8.
     Persistent positive/negative caching prevents repeated queries for known BSSIDs.
 
+.PARAMETER MaxWigleBluetoothLookupsPerRun
+    Maximum number of WiGLE Bluetooth exact-MAC lookups used by the edge-triggered
+    RF Location Fusion resolver. Default: 6. These lookups are never performed in
+    normal mode when a higher-confidence physical location already exists.
+
+.PARAMETER RfFusionBluetoothScanSeconds
+    Passive BLE scan window used only when RF Location Fusion is activated and
+    Bluetooth was not already requested. Default: 5 seconds.
+
+.PARAMETER DisableRfFusion
+    Disable the edge-triggered RF Location Fusion recovery path.
+
+.PARAMETER DisableUnderlayStunProbe
+    Disable the source-bound STUN underlay public-IP probe. This probe is only
+    attempted in an unresolved VPN-over-Wi-Fi edge case. It deliberately uses the
+    proven physical Wi-Fi underlay rather than the VPN and therefore can reveal the
+    real ISP/carrier-facing public IP without changing routes.
+
+.PARAMETER DisableRfAnchorLearning
+    Disable the local hashed RF-anchor learning/cache. When enabled (default), the script
+    may learn hashes of stable public BLE identities only during a trustworthy physical
+    location fix and use three or more matching cached anchors during a later edge run.
+    Raw BLE MAC addresses are never written to the cache.
+
 .PARAMETER WifiMapPath
     Optional CSV containing known BSSID-to-site mappings:
       BSSID,Latitude,Longitude,Site,AccuracyMeters
@@ -90,19 +114,19 @@
     the complete internal evidence set regardless of this display option.
 
 .EXAMPLE
-    ./Get-DeviceCoords-v3.65.3.ps1 -IncludeWifiEvidence | Format-List *
+    ./Get-DeviceCoords-v3.67.1.ps1 -IncludeWifiEvidence | Format-List *
 
 .EXAMPLE
     $env:GOOGLE_GEO_API_KEY = '<key>'
-    ./Get-DeviceCoords-v3.65.3.ps1 -IncludeWifiEvidence | Format-List *
+    ./Get-DeviceCoords-v3.67.1.ps1 -IncludeWifiEvidence | Format-List *
 
 .EXAMPLE
     $env:WIGLE_API_NAME = '<api-name>'
     $env:WIGLE_API_TOKEN = '<api-token>'
-    ./Get-DeviceCoords-v3.65.3.ps1 | Format-List *
+    ./Get-DeviceCoords-v3.67.1.ps1 | Format-List *
 
 .EXAMPLE
-    ./Get-DeviceCoords-v3.65.3.ps1 -WifiMapPath ./Corporate-WifiLocations.csv
+    ./Get-DeviceCoords-v3.67.1.ps1 -WifiMapPath ./Corporate-WifiLocations.csv
 
 .NOTES
     Lean production build preserving v3.40 collection/output functionality and adding
@@ -111,11 +135,11 @@
     donation/commercial-use flag.
     Windows PowerShell 5.1 compatibility is retained; PowerShell 7 is recommended.
     Execution is quiet by default. Use -Verbose for collection/diagnostic output.
-    v3.65.3 keeps the v3.64 collection/resolver behavior, retains the v3.65 concise presentation, and removes PSScriptAnalyzer variable hazards/dead assignments:
+    v3.67.1 extends RF Location Fusion with Windows physical-underlay IPv6 locality, local-DNS/ECS locality evidence, and a hashed local learned-BLE anchor cache. These remain edge-recovery mechanisms; normal GPS/known-anchor/Wi-Fi/native-location resolvers still win and do not pay the heavier recovery cost. The v3.66.1 source-bound STUN repair is retained unchanged.
+    v3.67.1 hardens learned BLE anchors with Candidate/Probable/Trusted maturity, weighted RF scoring, a minimum score/trusted-anchor gate, cluster-spread enforcement, evidence age/last-confirmed telemetry, and backward-compatible migration from rf-anchor-cache-v1.json to rf-anchor-cache-v2.json. Resolver priority/order is unchanged.
     successful fallback engines no longer surface failure text as normal status detail,
     verbose diagnostics are summarized, and large RF evidence tables are capped by default.
-    v3.65.3 also removes automatic-variable collisions and dead presentation-layer assignments
-    identified by PSScriptAnalyzer without changing resolver or collector behavior.
+    It also always collects Windows VPN-underlay path evidence when an endpoint VPN is established, even when a stronger physical resolver already succeeded. Underlay IP geolocation is explicitly treated as carrier/ISP path context and may represent a network POP rather than the device position.
     Use -FullEvidence to render all Wi-Fi/Bluetooth evidence rows.
     Explicit Bluetooth parameters force Bluetooth scan outcome/evidence into the normal result. v3.49 uses the validated in-memory Windows PowerShell/C# BLE bridge and renders BLE evidence as a compact table. Windows BLE uses the current PowerShell WinRT projection first and automatically falls back to Windows PowerShell 5.1 when required.
     WifiEvidence remains the final output property.
@@ -135,6 +159,18 @@ param(
 
     [ValidateRange(1, 20)]
     [int]$MaxWigleLookupsPerRun = 8,
+
+    [ValidateRange(1, 12)]
+    [int]$MaxWigleBluetoothLookupsPerRun = 6,
+
+    [ValidateRange(2, 15)]
+    [int]$RfFusionBluetoothScanSeconds = 5,
+
+    [switch]$DisableRfFusion,
+
+    [switch]$DisableUnderlayStunProbe,
+
+    [switch]$DisableRfAnchorLearning,
 
     [ValidateScript({ Test-Path -LiteralPath $_ -PathType Leaf })]
     [string]$WifiMapPath,
@@ -193,6 +229,8 @@ else {
     4
 }
 
+$bluetoothEvidenceScanSeconds = $effectiveBluetoothScanSeconds
+
 # Always initialize optional Google resolver diagnostics before any branch can read them.
 # Under StrictMode, reading an unset script-scoped variable terminates the script.
 $script:GoogleWifiLastHttpStatus = $null
@@ -218,6 +256,14 @@ $script:WigleCurrentBssidPrioritized = $false
 $script:WigleCurrentBssid = $null
 $script:WigleCurrentBssidEligibility = 'Unavailable'
 $script:WigleCandidateOrder = @()
+
+$script:WigleBluetoothLastHttpStatus = $null
+$script:WigleBluetoothLastErrorMessage = $null
+$script:WigleBluetoothLiveQueriesUsed = 0
+$script:WigleBluetoothCandidateCount = 0
+$script:WigleBluetoothMatchCount = 0
+$script:WigleBluetoothClusterCount = 0
+$script:WigleBluetoothClusterRadiusKm = $null
 
 # Per-run caches for stable values. These are deliberately process-local only.
 $script:PlatformNameCache = $null
@@ -1161,10 +1207,140 @@ function Get-WindowsLocationServiceState {
     }
 }
 
+function Get-WindowsLocationGlobalState {
+    if ((Get-PlatformName) -ne 'Windows') { return 'NotApplicable' }
+
+    $path = 'Registry::HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\location'
+
+    try {
+        $item = Get-ItemProperty -LiteralPath $path -Name Value -ErrorAction Stop
+        $value = [string]$item.Value
+
+        switch ($value) {
+            'Allow' { return 'Enabled' }
+            'Deny'  { return 'Disabled' }
+            default {
+                if ([string]::IsNullOrWhiteSpace($value)) { return 'Unknown' }
+                return 'Unknown:{0}' -f $value
+            }
+        }
+    }
+    catch {
+        return 'Unknown'
+    }
+}
+
+function Get-WindowsLocationPolicyState {
+    if ((Get-PlatformName) -ne 'Windows') { return 'NotApplicable' }
+
+    $path = 'Registry::HKEY_LOCAL_MACHINE\SOFTWARE\Policies\Microsoft\Windows\LocationAndSensors'
+
+    try {
+        $item = Get-ItemProperty -LiteralPath $path -Name DisableLocation -ErrorAction Stop
+        $value = [int]$item.DisableLocation
+
+        if ($value -ne 0) { return 'DisabledByPolicy' }
+        return 'NotDisabledByPolicy'
+    }
+    catch {
+        return 'NotConfigured'
+    }
+}
+
+function Get-WindowsLocationAccessState {
+    if ((Get-PlatformName) -ne 'Windows') {
+        return [pscustomobject]@{
+            GlobalState        = 'NotApplicable'
+            PolicyState        = 'NotApplicable'
+            UserConsent        = 'NotApplicable'
+            DesktopAppsConsent = 'NotApplicable'
+            EffectiveState     = 'NotApplicable'
+            CanModifyConsent   = $false
+            Detail             = 'Windows Location access state is Windows-only.'
+        }
+    }
+
+    $globalState = Get-WindowsLocationGlobalState
+    $policyState = Get-WindowsLocationPolicyState
+    $userValues = [System.Collections.Generic.List[string]]::new()
+    $desktopValues = [System.Collections.Generic.List[string]]::new()
+
+    foreach ($path in @(Get-WindowsLocationConsentTargets)) {
+        try {
+            $item = Get-ItemProperty -LiteralPath $path -Name Value -ErrorAction Stop
+            $value = [string]$item.Value
+
+            if ([string]::IsNullOrWhiteSpace($value)) { continue }
+
+            if ([string]$path -match '\\NonPackaged$') {
+                $desktopValues.Add($value)
+            }
+            else {
+                $userValues.Add($value)
+            }
+        }
+        catch { }
+    }
+
+    $summarize = {
+        param([System.Collections.Generic.List[string]]$Values)
+
+        if ($Values.Count -eq 0) { return 'Unset' }
+        if (@($Values | Where-Object { $_ -ne 'Allow' }).Count -eq 0) { return 'Allow' }
+        if (@($Values | Where-Object { $_ -ne 'Deny' }).Count -eq 0) { return 'Deny' }
+        return 'Mixed'
+    }
+
+    $userConsent = & $summarize $userValues
+    $desktopConsent = & $summarize $desktopValues
+
+    $effectiveState = 'Unknown'
+    $canModifyConsent = $true
+    $detail = 'Windows Location access state could not be fully determined.'
+
+    if ($policyState -eq 'DisabledByPolicy') {
+        $effectiveState = 'BlockedByPolicy'
+        $canModifyConsent = $false
+        $detail = 'Windows Location is disabled by policy (DisableLocation). User/DesktopApps consent cannot override this state.'
+    }
+    elseif ($globalState -eq 'Disabled') {
+        $effectiveState = 'BlockedBySystemGlobal'
+        $canModifyConsent = $false
+        $detail = 'Windows global/device Location Services is disabled. User/DesktopApps consent cannot override this state.'
+    }
+    elseif ($globalState -eq 'Enabled' -and
+            $userConsent -eq 'Allow' -and
+            $desktopConsent -eq 'Allow') {
+        $effectiveState = 'Allowed'
+        $detail = 'Windows global Location Services and both required desktop-user consent scopes are allowed.'
+    }
+    elseif ($globalState -eq 'Enabled') {
+        $effectiveState = 'UserConsentRequired'
+        $detail = 'Windows global Location Services is enabled, but one or more required user/DesktopApps consent scopes are not Allow.'
+    }
+
+    return [pscustomobject]@{
+        GlobalState        = $globalState
+        PolicyState        = $policyState
+        UserConsent        = $userConsent
+        DesktopAppsConsent = $desktopConsent
+        EffectiveState     = $effectiveState
+        CanModifyConsent   = [bool]$canModifyConsent
+        Detail             = $detail
+    }
+}
+
 function Enable-WindowsTemporaryLocationConsent {
     $snapshots = [System.Collections.Generic.List[object]]::new()
 
     if ((Get-PlatformName) -ne 'Windows') {
+        return @()
+    }
+
+    $accessState = Get-WindowsLocationAccessState
+    if (-not $accessState.CanModifyConsent) {
+        Write-Verbose ('Windows location consent: not modified because effective state is [{0}].' -f
+            $accessState.EffectiveState)
         return @()
     }
 
@@ -1194,6 +1370,10 @@ function Enable-WindowsTemporaryLocationConsent {
                 $properties.PSObject.Properties.Name -contains 'Value') {
                 $valueExisted = $true
                 $originalValue = $properties.Value
+            }
+
+            if ($valueExisted -and [string]$originalValue -eq 'Allow') {
+                continue
             }
 
             $snapshots.Add([pscustomobject]@{
@@ -3816,6 +3996,1574 @@ function Get-WigleWifiLocation {
     return $null
 }
 
+
+
+# ---------------------------------------------------------------------------
+# RF Location Fusion helpers (v3.67.1)
+# ---------------------------------------------------------------------------
+
+function Invoke-WigleBluetoothLookup {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Address,
+
+        [Parameter(Mandatory)]
+        [string]$ApiName,
+
+        [Parameter(Mandatory)]
+        [string]$ApiToken
+    )
+
+    $script:WigleBluetoothLastHttpStatus = $null
+    $script:WigleBluetoothLastErrorMessage = $null
+
+    $normalized = Normalize-BluetoothAddress -Address $Address
+
+    if ($null -eq $normalized) {
+        return $null
+    }
+
+    $credentialText = [string]::Concat(
+        [string]$ApiName,
+        ':',
+        [string]$ApiToken
+    )
+
+    $credentialBytes = [Text.Encoding]::ASCII.GetBytes($credentialText)
+    $basic = [Convert]::ToBase64String($credentialBytes)
+
+    $uri = 'https://api.wigle.net/api/v2/bluetooth/search?resultsPerPage=5&showBle=true&netid={0}' -f
+        [Uri]::EscapeDataString($normalized)
+
+    $headers = @{
+        Accept        = 'application/json'
+        Authorization = 'Basic {0}' -f $basic
+    }
+
+    try {
+        $request = @{
+            Uri         = $uri
+            Method      = 'Get'
+            Headers     = $headers
+            TimeoutSec  = 8
+            ErrorAction = 'Stop'
+            Verbose     = $false
+        }
+
+        if ($PSVersionTable.PSVersion.Major -le 5) {
+            $request.UseBasicParsing = $true
+        }
+
+        $response = Invoke-WebRequest @request -Verbose:$false
+        $script:WigleBluetoothLiveQueriesUsed++
+
+        if ($response.PSObject.Properties.Name -contains 'StatusCode') {
+            $script:WigleBluetoothLastHttpStatus = [int]$response.StatusCode
+        }
+
+        $payload = [string]$response.Content | ConvertFrom-Json -ErrorAction Stop
+
+        if ($payload.success -ne $true) {
+            $script:WigleBluetoothLastErrorMessage = [string]$payload.message
+            return $null
+        }
+
+        $exact = @(
+            @($payload.results) |
+                Where-Object {
+                    (Normalize-BluetoothAddress -Address ([string]$_.netid)) -eq $normalized
+                } |
+                Where-Object {
+                    $null -ne $_.trilat -and $null -ne $_.trilong
+                } |
+                Select-Object -First 1
+        )
+
+        if ($exact.Count -eq 0) {
+            return [pscustomobject]@{
+                Found      = $false
+                Address    = $normalized
+                Latitude   = $null
+                Longitude  = $null
+                Name       = $null
+                DeviceType = $null
+                LastUpdate = $null
+            }
+        }
+
+        $result = $exact[0]
+
+        return [pscustomobject]@{
+            Found      = $true
+            Address    = $normalized
+            Latitude   = [double]$result.trilat
+            Longitude  = [double]$result.trilong
+            Name       = [string]$result.name
+            DeviceType = [string]$result.type
+            LastUpdate = [string]$result.lastupdt
+        }
+    }
+    catch {
+        $script:WigleBluetoothLiveQueriesUsed++
+
+        $httpDetail = Get-HttpErrorResponseDetail -ErrorRecord $_
+        $script:WigleBluetoothLastHttpStatus = $httpDetail.StatusCode
+        $script:WigleBluetoothLastErrorMessage = if (
+            -not [string]::IsNullOrWhiteSpace([string]$httpDetail.Message)
+        ) {
+            [string]$httpDetail.Message
+        }
+        else {
+            [string]$_.Exception.Message
+        }
+
+        Write-Verbose ('WiGLE Bluetooth lookup failed: address={0}; http={1}; message={2}' -f
+            $normalized,
+            $(if ($null -eq $script:WigleBluetoothLastHttpStatus) { '<unknown>' } else { $script:WigleBluetoothLastHttpStatus }),
+            $(if ([string]::IsNullOrWhiteSpace([string]$script:WigleBluetoothLastErrorMessage)) { '<none>' } else { $script:WigleBluetoothLastErrorMessage }))
+
+        return $null
+    }
+}
+
+function Get-WigleBluetoothRfLocation {
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [object[]]$Devices,
+
+        [Parameter(Mandatory)]
+        [string]$ApiName,
+
+        [Parameter(Mandatory)]
+        [string]$ApiToken,
+
+        [ValidateRange(1, 12)]
+        [int]$MaxLiveLookups = 6,
+
+        [ValidateRange(0.25, 10.0)]
+        [double]$ClusterRadiusKm = 2.0
+    )
+
+    # Random/private BLE addresses are intentionally excluded. They are frequently
+    # rotated by phones/headsets and are poor historical geolocation anchors.
+    $eligible = @(
+        $Devices |
+            Where-Object {
+                $null -ne $_ -and
+                [string]$_.AddressType -match '(?i)^Public$' -and
+                $null -ne (Normalize-BluetoothAddress -Address ([string]$_.Address)) -and
+                $null -ne $_.Rssi -and
+                [int]$_.Rssi -ge -105
+            } |
+            Sort-Object -Property @{
+                Expression = { [int]$_.Rssi }
+                Descending = $true
+            },
+            @{
+                Expression = { [string]$_.Address }
+                Descending = $false
+            } |
+            Group-Object Address |
+            ForEach-Object {
+                $_.Group | Select-Object -First 1
+            }
+    )
+
+    $script:WigleBluetoothCandidateCount = $eligible.Count
+    $script:WigleBluetoothMatchCount = 0
+    $script:WigleBluetoothClusterCount = 0
+    $script:WigleBluetoothClusterRadiusKm = $null
+
+    if ($eligible.Count -lt 2) {
+        return $null
+    }
+
+    $points = [System.Collections.Generic.List[object]]::new()
+
+    foreach ($device in @($eligible | Select-Object -First $MaxLiveLookups)) {
+        $lookup = Invoke-WigleBluetoothLookup `
+            -Address ([string]$device.Address) `
+            -ApiName $ApiName `
+            -ApiToken $ApiToken
+
+        if ($null -eq $lookup -or -not [bool]$lookup.Found) {
+            if ($script:WigleBluetoothLastHttpStatus -in @(401, 403, 429)) {
+                break
+            }
+            continue
+        }
+
+        $points.Add([pscustomobject]@{
+            Address     = [string]$lookup.Address
+            Name        = if (-not [string]::IsNullOrWhiteSpace([string]$device.Name)) {
+                              [string]$device.Name
+                          }
+                          else {
+                              [string]$lookup.Name
+                          }
+            Rssi        = [int]$device.Rssi
+            Latitude    = [double]$lookup.Latitude
+            Longitude   = [double]$lookup.Longitude
+            LastUpdate  = [string]$lookup.LastUpdate
+        })
+    }
+
+    $script:WigleBluetoothMatchCount = $points.Count
+
+    # Never select a location from one crowdsourced BLE device. Two independent
+    # public BLE identities must agree geographically before BLE becomes a locator.
+    if ($points.Count -lt 2) {
+        return $null
+    }
+
+    $bestCluster = @()
+
+    foreach ($candidate in $points) {
+        $cluster = @(
+            $points |
+                Where-Object {
+                    (Get-DistanceKm `
+                        -Latitude1 ([double]$candidate.Latitude) `
+                        -Longitude1 ([double]$candidate.Longitude) `
+                        -Latitude2 ([double]$_.Latitude) `
+                        -Longitude2 ([double]$_.Longitude)) -le $ClusterRadiusKm
+                }
+        )
+
+        if ($cluster.Count -gt $bestCluster.Count) {
+            $bestCluster = @($cluster)
+        }
+    }
+
+    if ($bestCluster.Count -lt 2) {
+        return $null
+    }
+
+    $latitude = [double](($bestCluster | Measure-Object Latitude -Average).Average)
+    $longitude = [double](($bestCluster | Measure-Object Longitude -Average).Average)
+
+    $maxDistanceKm = 0.0
+
+    foreach ($point in $bestCluster) {
+        $distance = Get-DistanceKm `
+            -Latitude1 $latitude `
+            -Longitude1 $longitude `
+            -Latitude2 ([double]$point.Latitude) `
+            -Longitude2 ([double]$point.Longitude)
+
+        if ($distance -gt $maxDistanceKm) {
+            $maxDistanceKm = $distance
+        }
+    }
+
+    $script:WigleBluetoothClusterCount = $bestCluster.Count
+    $script:WigleBluetoothClusterRadiusKm = [Math]::Round($maxDistanceKm, 2)
+
+    # Crowdsourced BLE is intentionally treated as a neighbourhood-level fix even
+    # when the returned points are tightly clustered.
+    $accuracyMeters = [Math]::Max(
+        500.0,
+        [Math]::Round(($maxDistanceKm * 1000.0) + 250.0, 0)
+    )
+
+    return [pscustomobject]@{
+        Method                    = 'WiGLEBluetoothCluster'
+        Latitude                  = $latitude
+        Longitude                 = $longitude
+        AccuracyMeters            = $accuracyMeters
+        Site                      = $null
+        VpnResistant              = $true
+        BluetoothAnchorsMatched   = $points.Count
+        BluetoothClusterCount     = $bestCluster.Count
+        BluetoothClusterRadiusKm  = [Math]::Round($maxDistanceKm, 2)
+        BluetoothAnchorAddresses  = @($bestCluster | ForEach-Object Address)
+        Detail                    = ('RF Location Fusion matched {0} independent public BLE device(s) in a {1} km WiGLE cluster; {2} BLE lookup(s) returned coordinates. VPN/public-IP evidence was not used.' -f
+                                        $bestCluster.Count,
+                                        [Math]::Round($maxDistanceKm, 2),
+                                        $points.Count)
+    }
+}
+
+function Initialize-SourceBoundStunApi {
+    if ($null -ne ('DeviceCoords.SourceBoundStunV367' -as [type])) {
+        return
+    }
+
+    $source = @'
+using System;
+using System.Net;
+using System.Net.Sockets;
+using System.Runtime.InteropServices;
+using System.Security.Cryptography;
+
+namespace DeviceCoords
+{
+    public sealed class SourceBoundStunResultV367
+    {
+        public bool Success { get; set; }
+        public string PublicIPAddress { get; set; }
+        public int PublicPort { get; set; }
+        public string ServerAddress { get; set; }
+        public string LocalSocketEndpoint { get; set; }
+        public string Stage { get; set; }
+        public bool InterfacePinApplied { get; set; }
+        public string InterfacePinMethod { get; set; }
+        public string Error { get; set; }
+    }
+
+    public static class SourceBoundStunV367
+    {
+        private const int IPPROTO_IP = 0;
+        private const int IP_UNICAST_IF = 31;
+        private const int SOCKET_ERROR = -1;
+
+        [DllImport("Ws2_32.dll", SetLastError = true)]
+        private static extern int setsockopt(
+            IntPtr socket,
+            int level,
+            int optionName,
+            ref int optionValue,
+            int optionLength);
+
+        [DllImport("Ws2_32.dll")]
+        private static extern int WSAGetLastError();
+
+        private static ushort ReadUInt16(byte[] data, int offset)
+        {
+            return (ushort)((data[offset] << 8) | data[offset + 1]);
+        }
+
+        private static uint ReadUInt32(byte[] data, int offset)
+        {
+            return ((uint)data[offset] << 24) |
+                   ((uint)data[offset + 1] << 16) |
+                   ((uint)data[offset + 2] << 8) |
+                   data[offset + 3];
+        }
+
+        private static bool TryPinIpv4Interface(Socket socket, int interfaceIndex, out string error)
+        {
+            error = null;
+
+            if (interfaceIndex <= 0)
+            {
+                error = "Interface index was not positive.";
+                return false;
+            }
+
+            // Windows IP_UNICAST_IF expects the IPv4 interface index as a DWORD
+            // in network byte order. The managed SocketOptionName enum does not
+            // expose this native Winsock option, so call setsockopt directly.
+            int networkOrderIndex = IPAddress.HostToNetworkOrder(interfaceIndex);
+            int rc = setsockopt(
+                socket.Handle,
+                IPPROTO_IP,
+                IP_UNICAST_IF,
+                ref networkOrderIndex,
+                sizeof(int));
+
+            if (rc == SOCKET_ERROR)
+            {
+                int wsaError = WSAGetLastError();
+                error = "setsockopt(IP_UNICAST_IF) failed with WSA error " + wsaError + ".";
+                return false;
+            }
+
+            return true;
+        }
+
+        public static SourceBoundStunResultV367 Query(
+            string sourceAddress,
+            int interfaceIndex,
+            string serverHost,
+            int serverPort,
+            int timeoutMilliseconds)
+        {
+            SourceBoundStunResultV367 result = new SourceBoundStunResultV367();
+            result.Stage = "Initialize";
+            result.InterfacePinMethod = "Winsock setsockopt(IP_UNICAST_IF)+Socket.Bind";
+
+            try
+            {
+                result.Stage = "ParseSourceAddress";
+                IPAddress source = IPAddress.Parse(sourceAddress);
+                if (source.AddressFamily != AddressFamily.InterNetwork)
+                {
+                    result.Error = "Source address was not IPv4.";
+                    return result;
+                }
+
+                result.Stage = "ResolveServer";
+                IPAddress target = null;
+
+                foreach (IPAddress candidate in Dns.GetHostAddresses(serverHost))
+                {
+                    if (candidate.AddressFamily == AddressFamily.InterNetwork)
+                    {
+                        target = candidate;
+                        break;
+                    }
+                }
+
+                if (target == null)
+                {
+                    result.Error = "No IPv4 STUN server address resolved.";
+                    return result;
+                }
+
+                result.ServerAddress = target.ToString() + ":" + serverPort;
+
+                using (Socket socket = new Socket(
+                    AddressFamily.InterNetwork,
+                    SocketType.Dgram,
+                    ProtocolType.Udp))
+                {
+                    socket.ReceiveTimeout = timeoutMilliseconds;
+                    socket.SendTimeout = timeoutMilliseconds;
+
+                    result.Stage = "PinInterface";
+                    string pinError;
+                    if (!TryPinIpv4Interface(socket, interfaceIndex, out pinError))
+                    {
+                        result.Error = pinError;
+                        return result;
+                    }
+                    result.InterfacePinApplied = true;
+
+                    result.Stage = "BindSourceAddress";
+                    socket.Bind(new IPEndPoint(source, 0));
+                    result.LocalSocketEndpoint = socket.LocalEndPoint == null
+                        ? source.ToString()
+                        : socket.LocalEndPoint.ToString();
+
+                    byte[] request = new byte[20];
+                    request[0] = 0x00;
+                    request[1] = 0x01; // Binding Request
+                    request[2] = 0x00;
+                    request[3] = 0x00;
+                    request[4] = 0x21;
+                    request[5] = 0x12;
+                    request[6] = 0xA4;
+                    request[7] = 0x42;
+
+                    byte[] transactionId = new byte[12];
+                    using (RandomNumberGenerator rng = RandomNumberGenerator.Create())
+                    {
+                        rng.GetBytes(transactionId);
+                    }
+                    Buffer.BlockCopy(transactionId, 0, request, 8, 12);
+
+                    result.Stage = "SendRequest";
+                    EndPoint remote = new IPEndPoint(target, serverPort);
+                    socket.SendTo(request, remote);
+
+                    result.Stage = "ReceiveResponse";
+                    byte[] response = new byte[2048];
+                    EndPoint responder = new IPEndPoint(IPAddress.Any, 0);
+                    int received = socket.ReceiveFrom(response, ref responder);
+                    result.ServerAddress = responder.ToString();
+
+                    result.Stage = "ValidateResponse";
+                    if (received < 20)
+                    {
+                        result.Error = "STUN response was shorter than the 20-byte header.";
+                        return result;
+                    }
+
+                    if (response[0] != 0x01 || response[1] != 0x01)
+                    {
+                        result.Error = "STUN response was not a Binding Success Response.";
+                        return result;
+                    }
+
+                    uint cookie = ReadUInt32(response, 4);
+                    if (cookie != 0x2112A442)
+                    {
+                        result.Error = "STUN response magic cookie was invalid.";
+                        return result;
+                    }
+
+                    for (int i = 0; i < transactionId.Length; i++)
+                    {
+                        if (response[8 + i] != transactionId[i])
+                        {
+                            result.Error = "STUN response transaction ID did not match the request.";
+                            return result;
+                        }
+                    }
+
+                    result.Stage = "ParseMappedAddress";
+                    int offset = 20;
+
+                    while (offset + 4 <= received)
+                    {
+                        ushort type = ReadUInt16(response, offset);
+                        ushort length = ReadUInt16(response, offset + 2);
+                        int valueOffset = offset + 4;
+
+                        if (valueOffset + length > received)
+                        {
+                            result.Error = "STUN attribute length exceeded the received response.";
+                            return result;
+                        }
+
+                        if ((type == 0x0020 || type == 0x0001) &&
+                            length >= 8 &&
+                            response[valueOffset + 1] == 0x01)
+                        {
+                            ushort encodedPort = ReadUInt16(response, valueOffset + 2);
+                            byte[] addressBytes = new byte[4];
+                            Buffer.BlockCopy(response, valueOffset + 4, addressBytes, 0, 4);
+
+                            int port = encodedPort;
+
+                            if (type == 0x0020)
+                            {
+                                port = encodedPort ^ (int)(cookie >> 16);
+                                byte[] cookieBytes = new byte[] { 0x21, 0x12, 0xA4, 0x42 };
+
+                                for (int i = 0; i < 4; i++)
+                                {
+                                    addressBytes[i] = (byte)(addressBytes[i] ^ cookieBytes[i]);
+                                }
+                            }
+
+                            result.Success = true;
+                            result.PublicIPAddress = new IPAddress(addressBytes).ToString();
+                            result.PublicPort = port;
+                            result.Stage = "Resolved";
+                            return result;
+                        }
+
+                        offset = valueOffset + length;
+                        int padding = offset % 4;
+                        if (padding != 0)
+                        {
+                            offset += 4 - padding;
+                        }
+                    }
+
+                    result.Error = "STUN response did not contain an IPv4 MAPPED-ADDRESS or XOR-MAPPED-ADDRESS.";
+                    return result;
+                }
+            }
+            catch (SocketException socketException)
+            {
+                result.Error = "SocketException " + socketException.SocketErrorCode + " (" + socketException.ErrorCode + "): " + socketException.Message;
+                return result;
+            }
+            catch (Exception ex)
+            {
+                result.Error = ex.GetType().Name + ": " + ex.Message;
+                return result;
+            }
+        }
+    }
+}
+'@
+
+    Add-Type -TypeDefinition $source -Language CSharp -ErrorAction Stop
+}
+
+function Get-SourceBoundUnderlayPublicIp {
+    param(
+        [Parameter(Mandatory)]
+        [string]$LocalIPAddress,
+
+        [Parameter(Mandatory)]
+        [int]$InterfaceIndex
+    )
+
+    try {
+        Initialize-SourceBoundStunApi
+    }
+    catch {
+        return [pscustomobject]@{
+            Status              = 'ApiInitializationFailed'
+            PublicIPAddress     = $null
+            PublicPort          = $null
+            Server              = $null
+            Stage               = 'AddType'
+            InterfacePinApplied = $false
+            InterfacePinMethod  = 'Winsock setsockopt(IP_UNICAST_IF)+Socket.Bind'
+            LocalSocketEndpoint = $null
+            Error               = $_.Exception.Message
+        }
+    }
+
+    $servers = @(
+        [pscustomobject]@{ Host = 'stun.cloudflare.com'; Port = 3478 },
+        [pscustomobject]@{ Host = 'stun.l.google.com'; Port = 19302 }
+    )
+
+    $errors = [System.Collections.Generic.List[string]]::new()
+    $lastStage = 'NotAttempted'
+    $lastServer = $null
+    $lastPinApplied = $false
+    $lastPinMethod = 'Winsock setsockopt(IP_UNICAST_IF)+Socket.Bind'
+    $lastLocalEndpoint = $null
+
+    foreach ($server in $servers) {
+        $probe = [DeviceCoords.SourceBoundStunV367]::Query(
+            $LocalIPAddress,
+            $InterfaceIndex,
+            [string]$server.Host,
+            [int]$server.Port,
+            2500
+        )
+
+        if ($null -ne $probe) {
+            $lastStage = [string]$probe.Stage
+            $lastServer = if (-not [string]::IsNullOrWhiteSpace([string]$probe.ServerAddress)) {
+                [string]$probe.ServerAddress
+            }
+            else {
+                '{0}:{1}' -f $server.Host, $server.Port
+            }
+            $lastPinApplied = [bool]$probe.InterfacePinApplied
+            $lastPinMethod = [string]$probe.InterfacePinMethod
+            $lastLocalEndpoint = [string]$probe.LocalSocketEndpoint
+        }
+
+        if ($null -ne $probe -and
+            $probe.Success -and
+            (Test-PublicIpv4Address -IPAddress ([string]$probe.PublicIPAddress))) {
+
+            return [pscustomobject]@{
+                Status              = 'Resolved'
+                PublicIPAddress     = [string]$probe.PublicIPAddress
+                PublicPort          = [int]$probe.PublicPort
+                Server              = '{0}:{1}' -f $server.Host, $server.Port
+                Responder           = [string]$probe.ServerAddress
+                Stage               = [string]$probe.Stage
+                InterfacePinApplied = [bool]$probe.InterfacePinApplied
+                InterfacePinMethod  = [string]$probe.InterfacePinMethod
+                LocalSocketEndpoint = [string]$probe.LocalSocketEndpoint
+                Error               = $null
+            }
+        }
+
+        if ($null -ne $probe -and -not [string]::IsNullOrWhiteSpace([string]$probe.Error)) {
+            $errors.Add(('{0}:{1} stage={2} pin={3} error={4}' -f
+                $server.Host,
+                $server.Port,
+                $probe.Stage,
+                $probe.InterfacePinApplied,
+                $probe.Error))
+        }
+    }
+
+    return [pscustomobject]@{
+        Status              = 'NoResponse'
+        PublicIPAddress     = $null
+        PublicPort          = $null
+        Server              = $lastServer
+        Responder           = $null
+        Stage               = $lastStage
+        InterfacePinApplied = $lastPinApplied
+        InterfacePinMethod  = $lastPinMethod
+        LocalSocketEndpoint = $lastLocalEndpoint
+        Error               = if ($errors.Count -gt 0) { $errors -join ' | ' } else { 'No STUN response.' }
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Edge underlay locality and learned RF-anchor helpers (v3.67.1)
+# ---------------------------------------------------------------------------
+
+function Test-UsableGlobalIpv6Address {
+    param(
+        [Parameter(Mandatory)]
+        [string]$IPAddress
+    )
+
+    $parsed = $null
+    if (-not [System.Net.IPAddress]::TryParse($IPAddress, [ref]$parsed)) {
+        return $false
+    }
+
+    if ($parsed.AddressFamily -ne [System.Net.Sockets.AddressFamily]::InterNetworkV6) {
+        return $false
+    }
+
+    if ($parsed.Equals([System.Net.IPAddress]::IPv6Any) -or
+        $parsed.Equals([System.Net.IPAddress]::IPv6Loopback) -or
+        $parsed.IsIPv6LinkLocal -or
+        $parsed.IsIPv6Multicast) {
+        return $false
+    }
+
+    $bytes = $parsed.GetAddressBytes()
+
+    # fc00::/7 unique-local space is not globally routable.
+    if (($bytes[0] -band 0xFE) -eq 0xFC) { return $false }
+
+    # 2001:db8::/32 documentation space.
+    if ($bytes[0] -eq 0x20 -and $bytes[1] -eq 0x01 -and
+        $bytes[2] -eq 0x0D -and $bytes[3] -eq 0xB8) {
+        return $false
+    }
+
+    return $true
+}
+
+function Get-WindowsUnderlayIpv6Assessment {
+    param(
+        [Parameter(Mandatory)]
+        [int]$InterfaceIndex,
+
+        [Parameter(Mandatory)]
+        [string]$InterfaceAlias
+    )
+
+    $result = [ordered]@{
+        Status              = 'NotAttempted'
+        InterfaceAlias      = $InterfaceAlias
+        InterfaceIndex      = $InterfaceIndex
+        Address             = $null
+        PrefixLength        = $null
+        PrefixOrigin        = $null
+        SuffixOrigin        = $null
+        ClientGeo           = $null
+        TraceStatus         = 'NotAttempted'
+        TraceDestination    = '2606:4700:4700::1111'
+        TraceRows           = @()
+        FirstGlobalHop      = $null
+        FirstGlobalHopGeo   = $null
+        Error               = $null
+    }
+
+    if ($null -eq (Get-Command -Name Get-NetIPAddress -ErrorAction SilentlyContinue)) {
+        $result.Status = 'GetNetIpAddressUnavailable'
+        return [pscustomobject]$result
+    }
+
+    try {
+        $candidates = @(
+            Get-NetIPAddress `
+                -InterfaceIndex $InterfaceIndex `
+                -AddressFamily IPv6 `
+                -PolicyStore ActiveStore `
+                -ErrorAction Stop |
+                Where-Object {
+                    $null -ne $_ -and
+                    (Test-UsableGlobalIpv6Address -IPAddress ([string]$_.IPAddress))
+                } |
+                Sort-Object -Property @{
+                    Expression = { if ([string]$_.AddressState -eq 'Preferred') { 0 } else { 1 } }
+                    Descending = $false
+                }, @{
+                    Expression = { if ($_.SkipAsSource -eq $false) { 0 } else { 1 } }
+                    Descending = $false
+                }, @{
+                    Expression = { [int]$_.PrefixLength }
+                    Descending = $true
+                }
+        )
+    }
+    catch {
+        $result.Status = 'EnumerationFailed'
+        $result.Error = $_.Exception.Message
+        return [pscustomobject]$result
+    }
+
+    if ($candidates.Count -eq 0) {
+        $result.Status = 'NoGlobalIpv6'
+        return [pscustomobject]$result
+    }
+
+    $chosen = $candidates | Select-Object -First 1
+    $result.Address = [string]$chosen.IPAddress
+    $result.PrefixLength = [int]$chosen.PrefixLength
+    $result.PrefixOrigin = [string]$chosen.PrefixOrigin
+    $result.SuffixOrigin = [string]$chosen.SuffixOrigin
+
+    try {
+        $result.ClientGeo = Get-IpLocationByAddress -IPAddress ([string]$chosen.IPAddress)
+    }
+    catch { }
+
+    $tracert = Get-Command -Name tracert.exe -ErrorAction SilentlyContinue
+    if ($null -ne $tracert) {
+        try {
+            $traceOutput = @(
+                & $tracert.Source /6 /d /h 12 /w 800 /S ([string]$chosen.IPAddress) ([string]$result.TraceDestination) 2>&1
+            )
+
+            $traceRows = [System.Collections.Generic.List[object]]::new()
+
+            foreach ($traceLine in $traceOutput) {
+                $line = [string]$traceLine
+                if ($line -notmatch '^\s*(\d+)\s+') { continue }
+
+                $hopNumber = [int]$Matches[1]
+                $hopAddress = $null
+
+                foreach ($tokenMatch in [regex]::Matches($line, '(?i)[0-9a-f:]{2,}')) {
+                    $token = ([string]$tokenMatch.Value).Trim([char[]]'[]()')
+                    if ($token -notmatch ':') { continue }
+
+                    $parsedToken = $null
+                    if ([System.Net.IPAddress]::TryParse($token, [ref]$parsedToken) -and
+                        $parsedToken.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetworkV6) {
+                        $hopAddress = $parsedToken.IPAddressToString
+                    }
+                }
+
+                if ([string]::IsNullOrWhiteSpace([string]$hopAddress)) { continue }
+
+                $scope = if (Test-UsableGlobalIpv6Address -IPAddress $hopAddress) {
+                    'GlobalIPv6'
+                }
+                else {
+                    'NonGlobalIPv6'
+                }
+
+                $traceRows.Add([pscustomobject]@{
+                    Hop   = $hopNumber
+                    IP    = $hopAddress
+                    Scope = $scope
+                })
+            }
+
+            $result.TraceRows = @($traceRows)
+            $result.TraceStatus = if ($traceRows.Count -gt 0) { 'Observed' } else { 'NoRespondingIpv6Hops' }
+
+            $firstGlobal = @(
+                $traceRows |
+                    Where-Object {
+                        $_.Scope -eq 'GlobalIPv6' -and
+                        [string]$_.IP -ne [string]$chosen.IPAddress -and
+                        [string]$_.IP -ne [string]$result.TraceDestination
+                    } |
+                    Sort-Object Hop
+            ) | Select-Object -First 1
+
+            if ($null -ne $firstGlobal) {
+                $result.FirstGlobalHop = [string]$firstGlobal.IP
+                try {
+                    $result.FirstGlobalHopGeo = Get-IpLocationByAddress -IPAddress ([string]$firstGlobal.IP)
+                }
+                catch { }
+            }
+        }
+        catch {
+            $result.TraceStatus = 'TraceFailed'
+            $result.Error = $_.Exception.Message
+        }
+    }
+    else {
+        $result.TraceStatus = 'TracertUnavailable'
+    }
+
+    if ($null -ne $result.ClientGeo) {
+        $result.Status = 'ResolvedClientIpv6Geo'
+    }
+    elseif ($null -ne $result.FirstGlobalHopGeo) {
+        $result.Status = 'ResolvedIpv6TraceGeo'
+    }
+    else {
+        $result.Status = 'GlobalIpv6ObservedNoGeo'
+    }
+
+    return [pscustomobject]$result
+}
+
+function Get-WindowsUnderlayDnsLocalityAssessment {
+    param(
+        [Parameter(Mandatory)]
+        [int]$InterfaceIndex,
+
+        [AllowNull()]
+        [string]$DefaultGateway
+    )
+
+    $result = [ordered]@{
+        Status          = 'NotAttempted'
+        DnsServers      = @()
+        QueriedServers  = @()
+        TxtEvidence     = @()
+        ResolverPublicIp = $null
+        ResolverGeo     = $null
+        EcsSubnet       = $null
+        EcsAddress      = $null
+        EcsGeo          = $null
+        Error           = $null
+    }
+
+    if ($null -eq (Get-Command -Name Get-DnsClientServerAddress -ErrorAction SilentlyContinue) -or
+        $null -eq (Get-Command -Name Resolve-DnsName -ErrorAction SilentlyContinue)) {
+        $result.Status = 'DnsCmdletsUnavailable'
+        return [pscustomobject]$result
+    }
+
+    try {
+        $dnsServers = @(
+            Get-DnsClientServerAddress -InterfaceIndex $InterfaceIndex -ErrorAction Stop |
+                ForEach-Object { @($_.ServerAddresses) } |
+                Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } |
+                Select-Object -Unique
+        )
+    }
+    catch {
+        $result.Status = 'DnsServerEnumerationFailed'
+        $result.Error = $_.Exception.Message
+        return [pscustomobject]$result
+    }
+
+    $result.DnsServers = @($dnsServers)
+    if ($dnsServers.Count -eq 0) {
+        $result.Status = 'NoDnsServers'
+        return [pscustomobject]$result
+    }
+
+    $queryErrors = [System.Collections.Generic.List[string]]::new()
+
+    foreach ($server in $dnsServers) {
+        $serverText = [string]$server
+        $parsedServer = $null
+        if (-not [System.Net.IPAddress]::TryParse($serverText, [ref]$parsedServer)) { continue }
+
+        # Only trust a resolver that is demonstrably local to the physical underlay:
+        # RFC1918/CGNAT/link-local/ULA, or the actual underlay gateway. A public DNS
+        # server could be reached through the VPN after the tunnel installs routes.
+        $trustedUnderlayResolver = $false
+
+        if ($parsedServer.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetwork) {
+            $scope = Get-Ipv4AddressScope -IPAddress $serverText
+            if ($scope -ne 'Public') { $trustedUnderlayResolver = $true }
+        }
+        elseif ($parsedServer.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetworkV6) {
+            if (-not (Test-UsableGlobalIpv6Address -IPAddress $serverText)) {
+                $trustedUnderlayResolver = $true
+            }
+        }
+
+        if (-not [string]::IsNullOrWhiteSpace([string]$DefaultGateway) -and
+            $serverText -eq [string]$DefaultGateway) {
+            $trustedUnderlayResolver = $true
+        }
+
+        if (-not $trustedUnderlayResolver) { continue }
+
+        try {
+            $result.QueriedServers = @($result.QueriedServers + $serverText | Select-Object -Unique)
+            $dnsResponse = @(
+                Resolve-DnsName `
+                    -Name 'o-o.myaddr.l.google.com.' `
+                    -Type TXT `
+                    -Server $serverText `
+                    -DnsOnly `
+                    -QuickTimeout `
+                    -ErrorAction Stop
+            )
+
+            $txtValues = [System.Collections.Generic.List[string]]::new()
+            foreach ($record in $dnsResponse) {
+                if ($null -eq $record) { continue }
+                if ($record.PSObject.Properties.Name -contains 'Strings') {
+                    foreach ($piece in @($record.Strings)) {
+                        if (-not [string]::IsNullOrWhiteSpace([string]$piece)) {
+                            $txtValues.Add(([string]$piece).Trim('"'))
+                        }
+                    }
+                }
+            }
+
+            foreach ($textValue in @($txtValues)) {
+                $result.TxtEvidence = @($result.TxtEvidence + $textValue | Select-Object -Unique)
+
+                if ($textValue -match '(?i)edns0-client-subnet\s+([^\s]+)') {
+                    $subnet = [string]$Matches[1]
+                    $baseAddress = ($subnet -split '/', 2)[0]
+                    $parsedBase = $null
+
+                    if ([System.Net.IPAddress]::TryParse($baseAddress, [ref]$parsedBase)) {
+                        $isUsable = if ($parsedBase.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetwork) {
+                            Test-PublicIpv4Address -IPAddress $baseAddress
+                        }
+                        else {
+                            Test-UsableGlobalIpv6Address -IPAddress $baseAddress
+                        }
+
+                        if ($isUsable) {
+                            $result.EcsSubnet = $subnet
+                            $result.EcsAddress = $baseAddress
+                            try { $result.EcsGeo = Get-IpLocationByAddress -IPAddress $baseAddress } catch { }
+                        }
+                    }
+                }
+                else {
+                    $possibleAddress = $textValue.Trim()
+                    $parsedPossible = $null
+                    if ([System.Net.IPAddress]::TryParse($possibleAddress, [ref]$parsedPossible)) {
+                        $isUsable = if ($parsedPossible.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetwork) {
+                            Test-PublicIpv4Address -IPAddress $possibleAddress
+                        }
+                        else {
+                            Test-UsableGlobalIpv6Address -IPAddress $possibleAddress
+                        }
+
+                        if ($isUsable -and [string]::IsNullOrWhiteSpace([string]$result.ResolverPublicIp)) {
+                            $result.ResolverPublicIp = $possibleAddress
+                            try { $result.ResolverGeo = Get-IpLocationByAddress -IPAddress $possibleAddress } catch { }
+                        }
+                    }
+                }
+            }
+        }
+        catch {
+            $queryErrors.Add(('{0}: {1}' -f $serverText, $_.Exception.Message))
+        }
+    }
+
+    if ($null -ne $result.EcsGeo) {
+        $result.Status = 'ResolvedEcs'
+    }
+    elseif ($null -ne $result.ResolverGeo) {
+        $result.Status = 'ResolvedResolverLocality'
+    }
+    elseif (@($result.QueriedServers).Count -gt 0) {
+        $result.Status = 'QueriedNoLocality'
+    }
+    else {
+        $result.Status = 'NoTrustedUnderlayDnsServer'
+    }
+
+    if ($queryErrors.Count -gt 0) {
+        $result.Error = $queryErrors -join ' | '
+    }
+
+    return [pscustomobject]$result
+}
+
+function Get-RfAnchorCachePath {
+    $base = if ((Get-PlatformName) -eq 'Windows' -and -not [string]::IsNullOrWhiteSpace([string]$env:LOCALAPPDATA)) {
+        Join-Path -Path $env:LOCALAPPDATA -ChildPath 'Get-DeviceCoords'
+    }
+    elseif (-not [string]::IsNullOrWhiteSpace([string]$env:XDG_CACHE_HOME)) {
+        Join-Path -Path $env:XDG_CACHE_HOME -ChildPath 'get-device-coords'
+    }
+    else {
+        Join-Path -Path $HOME -ChildPath '.cache/get-device-coords'
+    }
+
+    return (Join-Path -Path $base -ChildPath 'rf-anchor-cache-v2.json')
+}
+
+function Get-RfAnchorLegacyCachePath {
+    $currentPath = Get-RfAnchorCachePath
+    return (Join-Path -Path (Split-Path -Path $currentPath -Parent) -ChildPath 'rf-anchor-cache-v1.json')
+}
+
+function Get-RfAnchorHash {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Identity
+    )
+
+    $normalized = $Identity.Trim().ToUpperInvariant()
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $bytes = [Text.Encoding]::UTF8.GetBytes($normalized)
+        return ([BitConverter]::ToString($sha.ComputeHash($bytes))).Replace('-', '')
+    }
+    finally {
+        $sha.Dispose()
+    }
+}
+
+function Get-RfAnchorMaturity {
+    param(
+        [int]$SeenSessions,
+        [int]$ConflictCount = 0
+    )
+
+    if ($ConflictCount -gt 0) { return 'Conflicted' }
+    if ($SeenSessions -ge 3) { return 'Trusted' }
+    if ($SeenSessions -eq 2) { return 'Probable' }
+    return 'Candidate'
+}
+
+function Get-RfAnchorWeight {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Maturity
+    )
+
+    switch ($Maturity) {
+        'Trusted'  { return 3 }
+        'Probable' { return 2 }
+        'Candidate' { return 1 }
+        default    { return 0 }
+    }
+}
+
+function Get-RfEvidenceAgeText {
+    param(
+        [AllowNull()]
+        [Nullable[datetime]]$TimestampUtc
+    )
+
+    if ($null -eq $TimestampUtc) { return 'NotAvailable' }
+    $age = [DateTime]::UtcNow - ([datetime]$TimestampUtc).ToUniversalTime()
+    if ($age.TotalSeconds -lt 0) { $age = [TimeSpan]::Zero }
+    return ('{0}d {1}h {2}m' -f [Math]::Floor($age.TotalDays), $age.Hours, $age.Minutes)
+}
+
+function ConvertTo-RfAnchorCacheEntry {
+    param(
+        [Parameter(Mandatory)]
+        [object]$Entry
+    )
+
+    $seenSessions = if ($Entry.PSObject.Properties.Name -contains 'SeenSessions' -and $null -ne $Entry.SeenSessions) {
+        [Math]::Max(1, [int]$Entry.SeenSessions)
+    }
+    else {
+        1
+    }
+
+    $conflictCount = if ($Entry.PSObject.Properties.Name -contains 'ConflictCount' -and $null -ne $Entry.ConflictCount) {
+        [Math]::Max(0, [int]$Entry.ConflictCount)
+    }
+    else {
+        0
+    }
+
+    $maturity = Get-RfAnchorMaturity -SeenSessions $seenSessions -ConflictCount $conflictCount
+
+    return [pscustomobject]@{
+        Hash          = [string]$Entry.Hash
+        Latitude      = [double]$Entry.Latitude
+        Longitude     = [double]$Entry.Longitude
+        SeenSessions  = $seenSessions
+        ConflictCount = $conflictCount
+        Maturity      = $maturity
+        FirstSeenUtc  = [string]$Entry.FirstSeenUtc
+        LastSeenUtc   = [string]$Entry.LastSeenUtc
+    }
+}
+
+function Read-RfAnchorCache {
+    $path = Get-RfAnchorCachePath
+    $legacyPath = Get-RfAnchorLegacyCachePath
+    $entries = [System.Collections.Generic.List[object]]::new()
+    $sourcePath = $path
+    $sourceVersion = 2
+    $migratedFromLegacy = $false
+
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf) -and (Test-Path -LiteralPath $legacyPath -PathType Leaf)) {
+        $sourcePath = $legacyPath
+        $sourceVersion = 1
+        $migratedFromLegacy = $true
+    }
+
+    if (Test-Path -LiteralPath $sourcePath -PathType Leaf) {
+        try {
+            $raw = Get-Content -LiteralPath $sourcePath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+            if ($raw.PSObject.Properties.Name -contains 'Version' -and $null -ne $raw.Version) {
+                $sourceVersion = [int]$raw.Version
+            }
+
+            foreach ($entry in @($raw.Entries)) {
+                if ($null -eq $entry) { continue }
+                if ([string]::IsNullOrWhiteSpace([string]$entry.Hash)) { continue }
+                $entries.Add((ConvertTo-RfAnchorCacheEntry -Entry $entry))
+            }
+        }
+        catch {
+            Write-Verbose ('RF anchor cache read failed: {0}' -f $_.Exception.Message)
+        }
+    }
+
+    return [pscustomobject]@{
+        Path               = $path
+        SourcePath         = $sourcePath
+        LegacyPath         = $legacyPath
+        Version            = 2
+        SourceVersion      = $sourceVersion
+        MigratedFromLegacy = $migratedFromLegacy
+        Entries            = @($entries)
+    }
+}
+
+function Write-RfAnchorCache {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path,
+
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [object[]]$Entries
+    )
+
+    $folder = Split-Path -Path $Path -Parent
+    if (-not (Test-Path -LiteralPath $folder)) {
+        $null = New-Item -ItemType Directory -Path $folder -Force -ErrorAction Stop
+    }
+
+    $normalizedEntries = @(
+        foreach ($entry in @($Entries)) {
+            if ($null -eq $entry) { continue }
+            ConvertTo-RfAnchorCacheEntry -Entry $entry
+        }
+    )
+
+    $payload = [ordered]@{
+        Version    = 2
+        UpdatedUtc = [DateTime]::UtcNow.ToString('o')
+        Entries    = $normalizedEntries
+    }
+
+    $payload | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $Path -Encoding utf8 -Force
+}
+
+function Get-LearnedBluetoothRfLocation {
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [object[]]$Devices,
+
+        [ValidateRange(1, 30)]
+        [int]$MinimumRfScore = 7,
+
+        [ValidateRange(1, 10)]
+        [int]$MinimumTrustedMatches = 2,
+
+        [ValidateRange(0.1, 10.0)]
+        [double]$MaximumClusterRadiusKm = 2.0
+    )
+
+    $cache = Read-RfAnchorCache
+    $entryMap = @{}
+    foreach ($entry in @($cache.Entries)) {
+        if (-not [string]::IsNullOrWhiteSpace([string]$entry.Hash) -and [int]$entry.ConflictCount -eq 0) {
+            $entryMap[[string]$entry.Hash] = $entry
+        }
+    }
+
+    $anchorMatches = [System.Collections.Generic.List[object]]::new()
+    foreach ($device in @($Devices)) {
+        if ($null -eq $device) { continue }
+        if ([string]$device.AddressType -notmatch '(?i)^Public$') { continue }
+        $normalized = Normalize-BluetoothAddress -Address ([string]$device.Address)
+        if ($null -eq $normalized) { continue }
+
+        $hash = Get-RfAnchorHash -Identity ('BLE:' + $normalized)
+        if ($entryMap.ContainsKey($hash)) {
+            $entry = $entryMap[$hash]
+            $maturity = Get-RfAnchorMaturity -SeenSessions ([int]$entry.SeenSessions) -ConflictCount ([int]$entry.ConflictCount)
+            $anchorMatches.Add([pscustomobject]@{
+                Hash          = $hash
+                Latitude      = [double]$entry.Latitude
+                Longitude     = [double]$entry.Longitude
+                SeenSessions  = [int]$entry.SeenSessions
+                Maturity      = $maturity
+                Weight        = Get-RfAnchorWeight -Maturity $maturity
+                LastSeenUtc   = [string]$entry.LastSeenUtc
+            })
+        }
+    }
+
+    $uniqueMatches = @($anchorMatches | Group-Object Hash | ForEach-Object { $_.Group | Select-Object -First 1 })
+    $candidateCount = @($uniqueMatches | Where-Object { $_.Maturity -eq 'Candidate' }).Count
+    $probableCount = @($uniqueMatches | Where-Object { $_.Maturity -eq 'Probable' }).Count
+    $trustedCount = @($uniqueMatches | Where-Object { $_.Maturity -eq 'Trusted' }).Count
+    $rfScore = [int](($uniqueMatches | Measure-Object Weight -Sum).Sum)
+
+    $lastConfirmedUtc = $null
+    $trustedTimestamps = @(
+        $uniqueMatches |
+            Where-Object { $_.Maturity -eq 'Trusted' -and -not [string]::IsNullOrWhiteSpace([string]$_.LastSeenUtc) } |
+            ForEach-Object {
+                try { [datetime]::Parse([string]$_.LastSeenUtc).ToUniversalTime() } catch { }
+            }
+    )
+    if ($trustedTimestamps.Count -gt 0) {
+        $lastConfirmedUtc = @($trustedTimestamps | Sort-Object -Descending)[0]
+    }
+
+    $evidenceAge = Get-RfEvidenceAgeText -TimestampUtc $lastConfirmedUtc
+    $lastConfirmedText = if ($null -ne $lastConfirmedUtc) { ([datetime]$lastConfirmedUtc).ToString('o') } else { 'NotAvailable' }
+
+    $baseEvidence = ('Matched={0}; Candidate={1}; Probable={2}; Trusted={3}; Score={4}/{5}; TrustedRequired={6}; LastConfirmedUtc={7}; EvidenceAge={8}' -f
+        $uniqueMatches.Count,
+        $candidateCount,
+        $probableCount,
+        $trustedCount,
+        $rfScore,
+        $MinimumRfScore,
+        $MinimumTrustedMatches,
+        $lastConfirmedText,
+        $evidenceAge)
+
+    if ($uniqueMatches.Count -eq 0) {
+        return [pscustomobject]@{
+            Location             = $null
+            Status               = if (@($cache.Entries).Count -eq 0) { 'CacheEmpty' } else { 'NoMatches' }
+            MatchCount           = 0
+            CandidateCount       = 0
+            ProbableCount        = 0
+            TrustedCount         = 0
+            RfScore              = 0
+            RequiredRfScore      = $MinimumRfScore
+            RequiredTrustedCount = $MinimumTrustedMatches
+            ClusterRadiusKm      = $null
+            LastConfirmedUtc     = 'NotAvailable'
+            EvidenceAge          = 'NotAvailable'
+            EvidenceText         = $baseEvidence
+            CacheCount           = @($cache.Entries).Count
+            CachePath            = $cache.Path
+            CacheVersion         = $cache.Version
+            MigratedFromLegacy   = [bool]$cache.MigratedFromLegacy
+        }
+    }
+
+    $totalWeight = [double](($uniqueMatches | Measure-Object Weight -Sum).Sum)
+    if ($totalWeight -le 0) { $totalWeight = [double]$uniqueMatches.Count }
+
+    $weightedLat = 0.0
+    $weightedLon = 0.0
+    foreach ($match in $uniqueMatches) {
+        $weight = if ([int]$match.Weight -gt 0) { [double]$match.Weight } else { 1.0 }
+        $weightedLat += ([double]$match.Latitude * $weight)
+        $weightedLon += ([double]$match.Longitude * $weight)
+    }
+    $lat = $weightedLat / $totalWeight
+    $lon = $weightedLon / $totalWeight
+    $maxDistance = 0.0
+
+    foreach ($match in $uniqueMatches) {
+        $distance = Get-DistanceKm `
+            -Latitude1 ([double]$lat) `
+            -Longitude1 ([double]$lon) `
+            -Latitude2 ([double]$match.Latitude) `
+            -Longitude2 ([double]$match.Longitude)
+        if ($distance -gt $maxDistance) { $maxDistance = $distance }
+    }
+
+    $clusterRadiusRounded = [Math]::Round($maxDistance, 3)
+    $evidenceText = ('{0}; ClusterRadiusKm={1:N3}/{2:N3}' -f $baseEvidence, $maxDistance, $MaximumClusterRadiusKm)
+
+    # A learned RF fix is authoritative only after repeated trustworthy-location
+    # observations have matured enough anchors. Candidate/Probable entries remain
+    # evidence, but cannot resolve physical location by themselves.
+    if ($rfScore -lt $MinimumRfScore -or $trustedCount -lt $MinimumTrustedMatches) {
+        return [pscustomobject]@{
+            Location             = $null
+            Status               = 'InsufficientMaturity'
+            MatchCount           = $uniqueMatches.Count
+            CandidateCount       = $candidateCount
+            ProbableCount        = $probableCount
+            TrustedCount         = $trustedCount
+            RfScore              = $rfScore
+            RequiredRfScore      = $MinimumRfScore
+            RequiredTrustedCount = $MinimumTrustedMatches
+            ClusterRadiusKm      = $clusterRadiusRounded
+            LastConfirmedUtc     = $lastConfirmedText
+            EvidenceAge          = $evidenceAge
+            EvidenceText         = $evidenceText
+            CacheCount           = @($cache.Entries).Count
+            CachePath            = $cache.Path
+            CacheVersion         = $cache.Version
+            MigratedFromLegacy   = [bool]$cache.MigratedFromLegacy
+        }
+    }
+
+    if ($maxDistance -gt $MaximumClusterRadiusKm) {
+        return [pscustomobject]@{
+            Location             = $null
+            Status               = 'MatchesNotClustered'
+            MatchCount           = $uniqueMatches.Count
+            CandidateCount       = $candidateCount
+            ProbableCount        = $probableCount
+            TrustedCount         = $trustedCount
+            RfScore              = $rfScore
+            RequiredRfScore      = $MinimumRfScore
+            RequiredTrustedCount = $MinimumTrustedMatches
+            ClusterRadiusKm      = $clusterRadiusRounded
+            LastConfirmedUtc     = $lastConfirmedText
+            EvidenceAge          = $evidenceAge
+            EvidenceText         = $evidenceText
+            CacheCount           = @($cache.Entries).Count
+            CachePath            = $cache.Path
+            CacheVersion         = $cache.Version
+            MigratedFromLegacy   = [bool]$cache.MigratedFromLegacy
+        }
+    }
+
+    return [pscustomobject]@{
+        Location = [pscustomobject]@{
+            Method                    = 'LearnedBluetoothRfCluster'
+            Latitude                  = [double]$lat
+            Longitude                 = [double]$lon
+            AccuracyMeters            = [int][Math]::Max(250, [Math]::Ceiling($maxDistance * 1000.0))
+            Site                      = $null
+            VpnResistant              = $true
+            LearnedAnchorMatches      = $uniqueMatches.Count
+            LearnedAnchorCandidates   = $candidateCount
+            LearnedAnchorProbable     = $probableCount
+            LearnedAnchorTrusted      = $trustedCount
+            LearnedRfScore            = $rfScore
+            LearnedClusterRadiusKm    = $clusterRadiusRounded
+            LearnedLastConfirmedUtc   = $lastConfirmedText
+            LearnedPhysicalEvidenceAge= $evidenceAge
+            Detail                    = ('Matched {0} matured locally learned hashed public-BLE anchors: Candidate={1}, Probable={2}, Trusted={3}, RF score={4}, cluster radius={5:N3} km. Resolution gate requires score>={6}, Trusted>={7}, radius<={8:N3} km.' -f
+                $uniqueMatches.Count,
+                $candidateCount,
+                $probableCount,
+                $trustedCount,
+                $rfScore,
+                $maxDistance,
+                $MinimumRfScore,
+                $MinimumTrustedMatches,
+                $MaximumClusterRadiusKm)
+        }
+        Status               = 'Resolved'
+        MatchCount           = $uniqueMatches.Count
+        CandidateCount       = $candidateCount
+        ProbableCount        = $probableCount
+        TrustedCount         = $trustedCount
+        RfScore              = $rfScore
+        RequiredRfScore      = $MinimumRfScore
+        RequiredTrustedCount = $MinimumTrustedMatches
+        ClusterRadiusKm      = $clusterRadiusRounded
+        LastConfirmedUtc     = $lastConfirmedText
+        EvidenceAge          = $evidenceAge
+        EvidenceText         = $evidenceText
+        CacheCount           = @($cache.Entries).Count
+        CachePath            = $cache.Path
+        CacheVersion         = $cache.Version
+        MigratedFromLegacy   = [bool]$cache.MigratedFromLegacy
+    }
+}
+
+function Update-LearnedBluetoothRfAnchors {
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [object[]]$Devices,
+
+        [Parameter(Mandatory)]
+        [object]$Location
+    )
+
+    $cache = Read-RfAnchorCache
+    $entries = [System.Collections.Generic.List[object]]::new()
+    foreach ($existingEntry in @($cache.Entries)) {
+        $entries.Add((ConvertTo-RfAnchorCacheEntry -Entry $existingEntry))
+    }
+
+    $eligible = @(
+        $Devices |
+            Where-Object {
+                $null -ne $_ -and
+                [string]$_.AddressType -match '(?i)^Public$' -and
+                $null -ne (Normalize-BluetoothAddress -Address ([string]$_.Address) ) -and
+                $null -ne $_.Rssi -and
+                [int]$_.Rssi -ge -100 -and
+                (($_.PSObject.Properties.Name -notcontains 'SeenCount') -or [int]$_.SeenCount -ge 2)
+            } |
+            Sort-Object Address -Unique
+    )
+
+    if ($eligible.Count -eq 0) {
+        $candidateCount = @($entries | Where-Object { (Get-RfAnchorMaturity -SeenSessions ([int]$_.SeenSessions) -ConflictCount ([int]$_.ConflictCount)) -eq 'Candidate' }).Count
+        $probableCount = @($entries | Where-Object { (Get-RfAnchorMaturity -SeenSessions ([int]$_.SeenSessions) -ConflictCount ([int]$_.ConflictCount)) -eq 'Probable' }).Count
+        $trustedCount = @($entries | Where-Object { (Get-RfAnchorMaturity -SeenSessions ([int]$_.SeenSessions) -ConflictCount ([int]$_.ConflictCount)) -eq 'Trusted' }).Count
+        return [pscustomobject]@{
+            Status             = 'NoEligiblePublicBle'
+            CachePath          = $cache.Path
+            CacheCount         = $entries.Count
+            CacheVersion       = $cache.Version
+            MigratedFromLegacy = [bool]$cache.MigratedFromLegacy
+            CandidateCount     = $candidateCount
+            ProbableCount      = $probableCount
+            TrustedCount       = $trustedCount
+            Learned            = 0
+            Updated            = 0
+            Conflicts          = 0
+        }
+    }
+
+    $now = [DateTime]::UtcNow.ToString('o')
+    $learned = 0
+    $updated = 0
+    $conflicts = 0
+
+    foreach ($device in $eligible) {
+        $normalized = Normalize-BluetoothAddress -Address ([string]$device.Address)
+        $hash = Get-RfAnchorHash -Identity ('BLE:' + $normalized)
+        $existing = $entries | Where-Object { [string]$_.Hash -eq $hash } | Select-Object -First 1
+
+        if ($null -eq $existing) {
+            $entries.Add([pscustomobject]@{
+                Hash          = $hash
+                Latitude      = [double]$Location.Latitude
+                Longitude     = [double]$Location.Longitude
+                SeenSessions  = 1
+                ConflictCount = 0
+                Maturity      = 'Candidate'
+                FirstSeenUtc  = $now
+                LastSeenUtc   = $now
+            })
+            $learned++
+            continue
+        }
+
+        $distance = Get-DistanceKm `
+            -Latitude1 ([double]$existing.Latitude) `
+            -Longitude1 ([double]$existing.Longitude) `
+            -Latitude2 ([double]$Location.Latitude) `
+            -Longitude2 ([double]$Location.Longitude)
+
+        if ($distance -le 5.0) {
+            $oldCount = [Math]::Max(1, [int]$existing.SeenSessions)
+            $newCount = $oldCount + 1
+            $existing.Latitude = (([double]$existing.Latitude * $oldCount) + [double]$Location.Latitude) / $newCount
+            $existing.Longitude = (([double]$existing.Longitude * $oldCount) + [double]$Location.Longitude) / $newCount
+            $existing.SeenSessions = $newCount
+            $existing.Maturity = Get-RfAnchorMaturity -SeenSessions $newCount -ConflictCount ([int]$existing.ConflictCount)
+            $existing.LastSeenUtc = $now
+            $updated++
+        }
+        else {
+            $existing.ConflictCount = [int]$existing.ConflictCount + 1
+            $existing.Maturity = 'Conflicted'
+            $existing.LastSeenUtc = $now
+            $conflicts++
+        }
+    }
+
+    try {
+        Write-RfAnchorCache -Path $cache.Path -Entries @($entries)
+        $status = 'Updated'
+    }
+    catch {
+        $status = 'WriteFailed'
+        Write-Verbose ('RF anchor cache write failed: {0}' -f $_.Exception.Message)
+    }
+
+    $candidateCount = @($entries | Where-Object { (Get-RfAnchorMaturity -SeenSessions ([int]$_.SeenSessions) -ConflictCount ([int]$_.ConflictCount)) -eq 'Candidate' }).Count
+    $probableCount = @($entries | Where-Object { (Get-RfAnchorMaturity -SeenSessions ([int]$_.SeenSessions) -ConflictCount ([int]$_.ConflictCount)) -eq 'Probable' }).Count
+    $trustedCount = @($entries | Where-Object { (Get-RfAnchorMaturity -SeenSessions ([int]$_.SeenSessions) -ConflictCount ([int]$_.ConflictCount)) -eq 'Trusted' }).Count
+
+    return [pscustomobject]@{
+        Status             = $status
+        CachePath          = $cache.Path
+        CacheCount         = $entries.Count
+        CacheVersion       = $cache.Version
+        MigratedFromLegacy = [bool]$cache.MigratedFromLegacy
+        CandidateCount     = $candidateCount
+        ProbableCount      = $probableCount
+        TrustedCount       = $trustedCount
+        Learned            = $learned
+        Updated            = $updated
+        Conflicts          = $conflicts
+    }
+}
 
 # ---------------------------------------------------------------------------
 # Bluetooth LE proximity evidence
@@ -7370,9 +9118,13 @@ function Get-OpenVpnRemoteEndpoint {
 
                     foreach ($peer in $tcpPeers) {
                         $candidates.Add([pscustomobject]@{
-                            IP     = [string]$peer.RemoteAddress
-                            Port   = [int]$peer.RemotePort
-                            Source = 'OpenVPN established TCP peer'
+                            IP            = [string]$peer.RemoteAddress
+                            Port          = [int]$peer.RemotePort
+                            Source        = 'OpenVPN established TCP peer'
+                            LocalAddress  = [string]$peer.LocalAddress
+                            LocalPort     = [int]$peer.LocalPort
+                            OwningProcess = [int]$peer.OwningProcess
+                            Transport     = 'TCP'
                         })
                     }
                 }
@@ -8027,6 +9779,243 @@ function Get-WindowsVpnUnderlayRemoteEndpoint {
     return $null
 }
 
+function Initialize-WindowsSourceBoundIcmpTraceApi {
+    if ((Get-PlatformName) -ne 'Windows') {
+        return
+    }
+
+    if ($null -ne ('DeviceCoords.SourceBoundIcmpV3655' -as [type])) {
+        return
+    }
+
+    $source = @'
+using System;
+using System.Collections.Generic;
+using System.Net;
+using System.Runtime.InteropServices;
+
+namespace DeviceCoords
+{
+    public sealed class SourceBoundIcmpHopV3655
+    {
+        public int Hop { get; set; }
+        public string IP { get; set; }
+        public uint Status { get; set; }
+        public uint RoundTripTime { get; set; }
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct IP_OPTION_INFORMATION32_V3655
+    {
+        public byte Ttl;
+        public byte Tos;
+        public byte Flags;
+        public byte OptionsSize;
+        public uint OptionsData;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct ICMP_ECHO_REPLY32_V3655
+    {
+        public uint Address;
+        public uint Status;
+        public uint RoundTripTime;
+        public ushort DataSize;
+        public ushort Reserved;
+        public uint Data;
+        public IP_OPTION_INFORMATION32_V3655 Options;
+    }
+
+    public static class SourceBoundIcmpV3655
+    {
+        private const uint IP_SUCCESS = 0;
+        private const uint IP_TTL_EXPIRED_TRANSIT = 11013;
+
+        [DllImport("iphlpapi.dll", SetLastError = true)]
+        private static extern IntPtr IcmpCreateFile();
+
+        [DllImport("iphlpapi.dll", SetLastError = true)]
+        private static extern bool IcmpCloseHandle(IntPtr icmpHandle);
+
+        [DllImport("iphlpapi.dll", SetLastError = true)]
+        private static extern uint IcmpSendEcho2Ex(
+            IntPtr IcmpHandle,
+            IntPtr Event,
+            IntPtr ApcRoutine,
+            IntPtr ApcContext,
+            uint SourceAddress,
+            uint DestinationAddress,
+            byte[] RequestData,
+            ushort RequestSize,
+            ref IP_OPTION_INFORMATION32_V3655 RequestOptions,
+            IntPtr ReplyBuffer,
+            uint ReplySize,
+            uint Timeout
+        );
+
+        private static uint ToIpAddr(string text)
+        {
+            byte[] bytes = IPAddress.Parse(text).GetAddressBytes();
+            if (bytes.Length != 4)
+            {
+                throw new ArgumentException("IPv4 address required: " + text);
+            }
+            return BitConverter.ToUInt32(bytes, 0);
+        }
+
+        private static string FromIpAddr(uint address)
+        {
+            return new IPAddress(BitConverter.GetBytes(address)).ToString();
+        }
+
+        public static SourceBoundIcmpHopV3655[] Trace(
+            string sourceAddress,
+            string destinationAddress,
+            int maxHops,
+            int timeoutMilliseconds)
+        {
+            if (maxHops < 1) maxHops = 1;
+            if (maxHops > 30) maxHops = 30;
+            if (timeoutMilliseconds < 100) timeoutMilliseconds = 100;
+
+            uint source = ToIpAddr(sourceAddress);
+            uint destination = ToIpAddr(destinationAddress);
+            IntPtr handle = IcmpCreateFile();
+            if (handle == new IntPtr(-1))
+            {
+                throw new InvalidOperationException("IcmpCreateFile failed with Win32 error " + Marshal.GetLastWin32Error() + ".");
+            }
+
+            List<SourceBoundIcmpHopV3655> hops = new List<SourceBoundIcmpHopV3655>();
+            byte[] payload = new byte[] { 0x47, 0x44, 0x43, 0x36, 0x35, 0x35, 0x00, 0x01 };
+            const int replySize = 4096;
+
+            try
+            {
+                for (int ttl = 1; ttl <= maxHops; ttl++)
+                {
+                    IP_OPTION_INFORMATION32_V3655 options = new IP_OPTION_INFORMATION32_V3655();
+                    options.Ttl = (byte)ttl;
+                    options.Tos = 0;
+                    options.Flags = 0;
+                    options.OptionsSize = 0;
+                    options.OptionsData = 0;
+
+                    IntPtr replyBuffer = Marshal.AllocHGlobal(replySize);
+                    try
+                    {
+                        for (int i = 0; i < replySize; i++)
+                        {
+                            Marshal.WriteByte(replyBuffer, i, 0);
+                        }
+
+                        uint replyCount = IcmpSendEcho2Ex(
+                            handle,
+                            IntPtr.Zero,
+                            IntPtr.Zero,
+                            IntPtr.Zero,
+                            source,
+                            destination,
+                            payload,
+                            (ushort)payload.Length,
+                            ref options,
+                            replyBuffer,
+                            replySize,
+                            (uint)timeoutMilliseconds
+                        );
+
+                        if (replyCount == 0)
+                        {
+                            continue;
+                        }
+
+                        ICMP_ECHO_REPLY32_V3655 reply =
+                            (ICMP_ECHO_REPLY32_V3655)Marshal.PtrToStructure(
+                                replyBuffer,
+                                typeof(ICMP_ECHO_REPLY32_V3655)
+                            );
+
+                        string replyingIp = FromIpAddr(reply.Address);
+
+                        hops.Add(new SourceBoundIcmpHopV3655
+                        {
+                            Hop = ttl,
+                            IP = replyingIp,
+                            Status = reply.Status,
+                            RoundTripTime = reply.RoundTripTime
+                        });
+
+                        if (reply.Status == IP_SUCCESS ||
+                            String.Equals(replyingIp, destinationAddress, StringComparison.OrdinalIgnoreCase))
+                        {
+                            break;
+                        }
+
+                        if (reply.Status != IP_TTL_EXPIRED_TRANSIT)
+                        {
+                            // Keep useful ICMP errors in the result, but continue because a
+                            // later TTL may still produce a path hop on asymmetric networks.
+                        }
+                    }
+                    finally
+                    {
+                        Marshal.FreeHGlobal(replyBuffer);
+                    }
+                }
+            }
+            finally
+            {
+                IcmpCloseHandle(handle);
+            }
+
+            return hops.ToArray();
+        }
+    }
+}
+'@
+
+    Add-Type -TypeDefinition $source -Language CSharp -ErrorAction Stop
+}
+
+function Invoke-WindowsSourceBoundIcmpTrace {
+    param(
+        [Parameter(Mandatory)]
+        [string]$SourceIPAddress,
+
+        [Parameter(Mandatory)]
+        [string]$DestinationIPAddress,
+
+        [ValidateRange(1, 30)]
+        [int]$MaxHops = 8,
+
+        [ValidateRange(100, 5000)]
+        [int]$TimeoutMilliseconds = 900
+    )
+
+    if ((Get-PlatformName) -ne 'Windows') {
+        return @()
+    }
+
+    try {
+        Initialize-WindowsSourceBoundIcmpTraceApi
+        return @(
+            [DeviceCoords.SourceBoundIcmpV3655]::Trace(
+                $SourceIPAddress,
+                $DestinationIPAddress,
+                $MaxHops,
+                $TimeoutMilliseconds
+            )
+        )
+    }
+    catch {
+        Write-Verbose ('Source-bound ICMP trace failed from [{0}] to [{1}]: {2}' -f
+            $SourceIPAddress,
+            $DestinationIPAddress,
+            $_.Exception.Message)
+        return @()
+    }
+}
+
 function Get-WindowsVpnUnderlayAssessment {
     param(
         [Parameter(Mandatory)]
@@ -8038,24 +10027,30 @@ function Get-WindowsVpnUnderlayAssessment {
     )
 
     $empty = [pscustomobject]@{
-        Status             = 'Unresolved'
-        EndpointIP         = $null
-        EndpointSource     = $null
-        InterfaceAlias     = $null
-        InterfaceIndex     = $null
-        LocalIPAddress     = $null
-        NextHop            = $null
-        FirstPublicHop     = $null
-        FirstPublicHopIsp  = $null
-        FirstPublicHopAsn  = $null
-        FirstPublicHopCity = $null
-        FirstPublicHopRegion = $null
-        FirstPublicHopCountry = $null
-        FirstPublicHopLatitude = $null
-        FirstPublicHopLongitude = $null
-        TraceGeo           = @()
-        Location           = $null
-        Detail             = 'No Windows VPN underlay assessment was completed.'
+        Status                       = 'Unresolved'
+        EndpointIP                   = $null
+        EndpointSource               = $null
+        BindingSource                = $null
+        TraceMethod                  = $null
+        InterfaceAlias               = $null
+        InterfaceIndex               = $null
+        LocalIPAddress               = $null
+        NextHop                      = $null
+        FirstPublicHop               = $null
+        FirstPublicHopIsp            = $null
+        FirstPublicHopAsn            = $null
+        FirstPublicHopCity           = $null
+        FirstPublicHopRegion         = $null
+        FirstPublicHopCountry        = $null
+        FirstPublicHopLatitude       = $null
+        FirstPublicHopLongitude      = $null
+        CarrierNatDetected           = $false
+        CarrierNatHopCount           = 0
+        PathClass                    = 'NotObserved'
+        UpstreamClass                = 'Unknown'
+        TraceGeo                     = @()
+        Location                     = $null
+        Detail                       = 'No Windows VPN underlay assessment was completed.'
     }
 
     if ((Get-PlatformName) -ne 'Windows') {
@@ -8075,63 +10070,6 @@ function Get-WindowsVpnUnderlayAssessment {
     $empty.EndpointIP = [string]$endpoint.IP
     $empty.EndpointSource = [string]$endpoint.Source
 
-    if (-not (Get-Command -Name Find-NetRoute -ErrorAction SilentlyContinue)) {
-        $empty.Status = 'FindNetRouteUnavailable'
-        $empty.Detail = 'Find-NetRoute is unavailable, so the route carrying the VPN server connection cannot be proven.'
-        return $empty
-    }
-
-    $routeObjects = @()
-
-    try {
-        $routeObjects = @(
-            Find-NetRoute `
-                -RemoteIPAddress ([string]$endpoint.IP) `
-                -ErrorAction Stop
-        )
-    }
-    catch {
-        $empty.Status = 'RouteLookupFailed'
-        $empty.Detail = 'Unable to determine the Windows route to VPN endpoint [{0}]: {1}' -f
-            [string]$endpoint.IP,
-            $_.Exception.Message
-        return $empty
-    }
-
-    $route = @(
-        $routeObjects |
-            Where-Object {
-                $_.PSObject.Properties.Name -contains 'DestinationPrefix' -and
-                $_.PSObject.Properties.Name -contains 'InterfaceIndex'
-            }
-    ) | Select-Object -Last 1
-
-    $localAddress = @(
-        $routeObjects |
-            Where-Object {
-                $_.PSObject.Properties.Name -contains 'IPAddress' -and
-                $_.PSObject.Properties.Name -contains 'InterfaceIndex' -and
-                -not ($_.PSObject.Properties.Name -contains 'DestinationPrefix')
-            }
-    ) | Select-Object -First 1
-
-    if ($null -eq $route) {
-        $empty.Status = 'NoRouteObject'
-        $empty.Detail = 'Find-NetRoute did not return a usable route object for VPN endpoint [{0}].' -f
-            [string]$endpoint.IP
-        return $empty
-    }
-
-    $empty.InterfaceIndex = [int]$route.InterfaceIndex
-    $empty.InterfaceAlias = [string]$route.InterfaceAlias
-    $empty.NextHop = [string]$route.NextHop
-    $empty.LocalIPAddress = if ($null -ne $localAddress) {
-        [string]$localAddress.IPAddress
-    }
-    else {
-        $null
-    }
-
     $vpnInterfaceIndexes = @(
         $TunnelDetails |
             Where-Object {
@@ -8143,110 +10081,336 @@ function Get-WindowsVpnUnderlayAssessment {
             Select-Object -Unique
     )
 
-    if ($empty.InterfaceIndex -in $vpnInterfaceIndexes) {
-        $empty.Status = 'VpnRouteStillSelected'
-        $empty.Detail = 'The best route to VPN endpoint [{0}] still resolves to VPN interface index [{1}], so it cannot be used as physical-underlay evidence.' -f
-            [string]$endpoint.IP,
-            $empty.InterfaceIndex
-        return $empty
+    # Strongest evidence for TCP-based VPNs: the already-established VPN socket's
+    # LocalAddress is the pre-tunnel source binding. A post-tunnel route lookup can
+    # legitimately point back into the VPN and therefore cannot override this.
+    $socketBindingResolved = $false
+    $endpointLocalAddress = if (
+        $endpoint.PSObject.Properties.Name -contains 'LocalAddress' -and
+        -not [string]::IsNullOrWhiteSpace([string]$endpoint.LocalAddress)
+    ) {
+        [string]$endpoint.LocalAddress
+    }
+    else {
+        $null
     }
 
-    $tracert = Get-CommandPath -Candidates @(
-        $(if (-not [string]::IsNullOrWhiteSpace([string]$env:SystemRoot)) {
-            Join-Path -Path $env:SystemRoot -ChildPath 'System32\tracert.exe'
-        }),
-        'tracert.exe'
-    )
+    if (-not [string]::IsNullOrWhiteSpace([string]$endpointLocalAddress) -and
+        $endpointLocalAddress -notin @('0.0.0.0', '127.0.0.1')) {
 
-    if ([string]::IsNullOrWhiteSpace([string]$tracert)) {
-        $empty.Status = 'TracerouteUnavailable'
-        $empty.Detail = 'tracert.exe was not found; the VPN underlay route was identified but could not be traced.'
-        return $empty
+        try {
+            $boundAddresses = @(
+                Get-NetIPAddress `
+                    -IPAddress $endpointLocalAddress `
+                    -IncludeAllCompartments `
+                    -ErrorAction Stop |
+                    Where-Object {
+                        $_.AddressFamily -eq 'IPv4' -and
+                        $_.InterfaceIndex -notin $vpnInterfaceIndexes
+                    }
+            )
+
+            $boundAddress = $boundAddresses | Select-Object -First 1
+
+            if ($null -ne $boundAddress) {
+                $empty.InterfaceIndex = [int]$boundAddress.InterfaceIndex
+                $empty.InterfaceAlias = [string]$boundAddress.InterfaceAlias
+                $empty.LocalIPAddress = [string]$boundAddress.IPAddress
+                $empty.BindingSource = 'EstablishedVpnSocketLocalAddress'
+                $socketBindingResolved = $true
+
+                try {
+                    $defaultRoute = @(
+                        Get-NetRoute `
+                            -InterfaceIndex $empty.InterfaceIndex `
+                            -AddressFamily IPv4 `
+                            -ErrorAction Stop |
+                            Where-Object {
+                                $_.DestinationPrefix -eq '0.0.0.0/0' -and
+                                -not [string]::IsNullOrWhiteSpace([string]$_.NextHop) -and
+                                [string]$_.NextHop -ne '0.0.0.0'
+                            } |
+                            Sort-Object RouteMetric, InterfaceMetric
+                    ) | Select-Object -First 1
+
+                    if ($null -ne $defaultRoute) {
+                        $empty.NextHop = [string]$defaultRoute.NextHop
+                    }
+                }
+                catch {
+                    Write-Verbose ('Unable to resolve the default gateway for socket-bound VPN underlay interface [{0}]: {1}' -f
+                        $empty.InterfaceAlias,
+                        $_.Exception.Message)
+                }
+
+                Write-Verbose ('VPN underlay socket binding: endpoint={0}; local={1}; interface={2}/{3}; nextHop={4}.' -f
+                    $empty.EndpointIP,
+                    $empty.LocalIPAddress,
+                    $empty.InterfaceAlias,
+                    $empty.InterfaceIndex,
+                    $(if ([string]::IsNullOrWhiteSpace([string]$empty.NextHop)) { '<none>' } else { $empty.NextHop }))
+            }
+        }
+        catch {
+            Write-Verbose ('VPN underlay socket binding could not map local address [{0}] to a non-VPN interface: {1}' -f
+                $endpointLocalAddress,
+                $_.Exception.Message)
+        }
     }
 
-    $capture = $null
+    # Fallback for VPNs that do not expose a usable established TCP socket (for
+    # example UDP OpenVPN, WireGuard, or built-in VPNs). Here Find-NetRoute is still
+    # useful, but only when it resolves to a non-VPN interface.
+    if (-not $socketBindingResolved) {
+        if (-not (Get-Command -Name Find-NetRoute -ErrorAction SilentlyContinue)) {
+            $empty.Status = 'UnderlayRouteUnavailable'
+            $empty.Detail = 'No established VPN socket binding was available and Find-NetRoute is unavailable.'
+            return $empty
+        }
 
-    try {
-        $capture = Invoke-NativeCapture `
-            -FilePath $tracert `
-            -ArgumentList @(
-                '-4',
-                '-d',
-                '-h', '8',
-                '-w', '750',
+        $routeObjects = @()
+
+        try {
+            $routeObjects = @(
+                Find-NetRoute `
+                    -RemoteIPAddress ([string]$endpoint.IP) `
+                    -ErrorAction Stop
+            )
+        }
+        catch {
+            $empty.Status = 'RouteLookupFailed'
+            $empty.Detail = 'Unable to determine the Windows route to VPN endpoint [{0}]: {1}' -f
+                [string]$endpoint.IP,
+                $_.Exception.Message
+            return $empty
+        }
+
+        $route = @(
+            $routeObjects |
+                Where-Object {
+                    $_.PSObject.Properties.Name -contains 'DestinationPrefix' -and
+                    $_.PSObject.Properties.Name -contains 'InterfaceIndex'
+                }
+        ) | Select-Object -Last 1
+
+        $localAddress = @(
+            $routeObjects |
+                Where-Object {
+                    $_.PSObject.Properties.Name -contains 'IPAddress' -and
+                    $_.PSObject.Properties.Name -contains 'InterfaceIndex' -and
+                    -not ($_.PSObject.Properties.Name -contains 'DestinationPrefix')
+                }
+        ) | Select-Object -First 1
+
+        if ($null -eq $route) {
+            $empty.Status = 'NoRouteObject'
+            $empty.Detail = 'Find-NetRoute did not return a usable route object for VPN endpoint [{0}].' -f
                 [string]$endpoint.IP
-            ) `
-            -TimeoutSeconds 18
-    }
-    catch {
-        $empty.Status = 'TracerouteFailed'
-        $empty.Detail = 'Tracing the Windows underlay route to VPN endpoint [{0}] failed: {1}' -f
-            [string]$endpoint.IP,
-            $_.Exception.Message
-        return $empty
-    }
-
-    $rows = [System.Collections.Generic.List[object]]::new()
-    $seenHopIp = @{}
-
-    foreach ($line in @([string]$capture.StdOut -split "`r?`n")) {
-        $hopMatch = [regex]::Match($line, '^\s*(?<hop>\d+)\s+')
-        if (-not $hopMatch.Success) {
-            continue
+            return $empty
         }
 
-        $ipMatches = [regex]::Matches(
-            $line,
-            '(?<!\d)(?:\d{1,3}\.){3}\d{1,3}(?!\d)'
-        )
-
-        if ($ipMatches.Count -eq 0) {
-            continue
-        }
-
-        $ip = [string]$ipMatches[$ipMatches.Count - 1].Value
-        $key = '{0}|{1}' -f $hopMatch.Groups['hop'].Value, $ip
-
-        if ($seenHopIp.ContainsKey($key)) {
-            continue
-        }
-        $seenHopIp[$key] = $true
-
-        $isEndpoint = [string]::Equals(
-            $ip,
-            [string]$endpoint.IP,
-            [StringComparison]::OrdinalIgnoreCase
-        )
-
-        $scope = if ($isEndpoint) {
-            'VpnEndpoint'
-        }
-        else {
-            Get-Ipv4AddressScope -IPAddress $ip
-        }
-
-        $geo = if ($scope -eq 'Public') {
-            Get-IpLocationByAddress -IPAddress $ip
+        $empty.InterfaceIndex = [int]$route.InterfaceIndex
+        $empty.InterfaceAlias = [string]$route.InterfaceAlias
+        $empty.NextHop = [string]$route.NextHop
+        $empty.LocalIPAddress = if ($null -ne $localAddress) {
+            [string]$localAddress.IPAddress
         }
         else {
             $null
         }
+        $empty.BindingSource = 'FindNetRoute'
 
-        $rows.Add([pscustomobject]@{
-            Hop       = [int]$hopMatch.Groups['hop'].Value
-            IP        = $ip
-            Scope     = $scope
-            City      = if ($null -ne $geo) { [string]$geo.City } else { $null }
-            Region    = if ($null -ne $geo) { [string]$geo.Region } else { $null }
-            Country   = if ($null -ne $geo) { [string]$geo.Country } else { $null }
-            ISP       = if ($null -ne $geo) { [string]$geo.ISP } else { $null }
-            ASN       = if ($null -ne $geo) { [string]$geo.ASN } else { $null }
-            Latitude  = if ($null -ne $geo) { $geo.Latitude } else { $null }
-            Longitude = if ($null -ne $geo) { $geo.Longitude } else { $null }
-        })
+        if ($empty.InterfaceIndex -in $vpnInterfaceIndexes) {
+            $empty.Status = 'VpnRouteStillSelected'
+            $empty.Detail = 'The current route to VPN endpoint [{0}] resolves to VPN interface index [{1}], and no established socket binding exposed the physical underlay.' -f
+                [string]$endpoint.IP,
+                $empty.InterfaceIndex
+            return $empty
+        }
+    }
+
+    $rows = [System.Collections.Generic.List[object]]::new()
+
+    if ($socketBindingResolved -and
+        -not [string]::IsNullOrWhiteSpace([string]$empty.LocalIPAddress)) {
+
+        # IcmpSendEcho2Ex accepts an explicit IPv4 source address, so this trace is
+        # bound to the same physical source address as the established VPN socket.
+        # It does not modify routes and is safe to fail when ICMP is filtered.
+        $sourceBoundHops = @(
+            Invoke-WindowsSourceBoundIcmpTrace `
+                -SourceIPAddress $empty.LocalIPAddress `
+                -DestinationIPAddress ([string]$endpoint.IP) `
+                -MaxHops 8 `
+                -TimeoutMilliseconds 900
+        )
+
+        if ($sourceBoundHops.Count -gt 0) {
+            $empty.TraceMethod = 'IcmpSendEcho2ExSourceBound'
+
+            foreach ($traceHop in $sourceBoundHops) {
+                if ([string]::IsNullOrWhiteSpace([string]$traceHop.IP)) {
+                    continue
+                }
+
+                $ip = [string]$traceHop.IP
+                $isEndpoint = [string]::Equals(
+                    $ip,
+                    [string]$endpoint.IP,
+                    [StringComparison]::OrdinalIgnoreCase
+                )
+
+                $scope = if ($isEndpoint) {
+                    'VpnEndpoint'
+                }
+                else {
+                    Get-Ipv4AddressScope -IPAddress $ip
+                }
+
+                $geo = if ($scope -eq 'Public') {
+                    Get-IpLocationByAddress -IPAddress $ip
+                }
+                else {
+                    $null
+                }
+
+                $rows.Add([pscustomobject]@{
+                    Hop       = [int]$traceHop.Hop
+                    IP        = $ip
+                    Scope     = $scope
+                    City      = if ($null -ne $geo) { [string]$geo.City } else { $null }
+                    Region    = if ($null -ne $geo) { [string]$geo.Region } else { $null }
+                    Country   = if ($null -ne $geo) { [string]$geo.Country } else { $null }
+                    ISP       = if ($null -ne $geo) { [string]$geo.ISP } else { $null }
+                    ASN       = if ($null -ne $geo) { [string]$geo.ASN } else { $null }
+                    Latitude  = if ($null -ne $geo) { $geo.Latitude } else { $null }
+                    Longitude = if ($null -ne $geo) { $geo.Longitude } else { $null }
+                })
+            }
+        }
+    }
+
+    # Route-based fallback trace is only used when the underlay was resolved from
+    # routing itself. We deliberately do not use ordinary tracert after a socket
+    # binding was proven because a full-tunnel VPN can redirect a new tracert flow.
+    if ($rows.Count -eq 0 -and -not $socketBindingResolved) {
+        $tracert = Get-CommandPath -Candidates @(
+            $(if (-not [string]::IsNullOrWhiteSpace([string]$env:SystemRoot)) {
+                Join-Path -Path $env:SystemRoot -ChildPath 'System32\tracert.exe'
+            }),
+            'tracert.exe'
+        )
+
+        if (-not [string]::IsNullOrWhiteSpace([string]$tracert)) {
+            try {
+                $capture = Invoke-NativeCapture `
+                    -FilePath $tracert `
+                    -ArgumentList @(
+                        '-4',
+                        '-d',
+                        '-h', '8',
+                        '-w', '750',
+                        [string]$endpoint.IP
+                    ) `
+                    -TimeoutSeconds 18
+
+                $empty.TraceMethod = 'TracertRouteBased'
+                $seenHopIp = @{}
+
+                foreach ($line in @([string]$capture.StdOut -split "`r?`n")) {
+                    $hopMatch = [regex]::Match($line, '^\s*(?<hop>\d+)\s+')
+                    if (-not $hopMatch.Success) {
+                        continue
+                    }
+
+                    $ipRegexMatches = [regex]::Matches(
+                        $line,
+                        '(?<!\d)(?:\d{1,3}\.){3}\d{1,3}(?!\d)'
+                    )
+
+                    if ($ipRegexMatches.Count -eq 0) {
+                        continue
+                    }
+
+                    $ip = [string]$ipRegexMatches[$ipRegexMatches.Count - 1].Value
+                    $key = '{0}|{1}' -f $hopMatch.Groups['hop'].Value, $ip
+
+                    if ($seenHopIp.ContainsKey($key)) {
+                        continue
+                    }
+                    $seenHopIp[$key] = $true
+
+                    $isEndpoint = [string]::Equals(
+                        $ip,
+                        [string]$endpoint.IP,
+                        [StringComparison]::OrdinalIgnoreCase
+                    )
+
+                    $scope = if ($isEndpoint) {
+                        'VpnEndpoint'
+                    }
+                    else {
+                        Get-Ipv4AddressScope -IPAddress $ip
+                    }
+
+                    $geo = if ($scope -eq 'Public') {
+                        Get-IpLocationByAddress -IPAddress $ip
+                    }
+                    else {
+                        $null
+                    }
+
+                    $rows.Add([pscustomobject]@{
+                        Hop       = [int]$hopMatch.Groups['hop'].Value
+                        IP        = $ip
+                        Scope     = $scope
+                        City      = if ($null -ne $geo) { [string]$geo.City } else { $null }
+                        Region    = if ($null -ne $geo) { [string]$geo.Region } else { $null }
+                        Country   = if ($null -ne $geo) { [string]$geo.Country } else { $null }
+                        ISP       = if ($null -ne $geo) { [string]$geo.ISP } else { $null }
+                        ASN       = if ($null -ne $geo) { [string]$geo.ASN } else { $null }
+                        Latitude  = if ($null -ne $geo) { $geo.Latitude } else { $null }
+                        Longitude = if ($null -ne $geo) { $geo.Longitude } else { $null }
+                    })
+                }
+            }
+            catch {
+                Write-Verbose ('Route-based VPN underlay trace failed for endpoint [{0}]: {1}' -f
+                    $endpoint.IP,
+                    $_.Exception.Message)
+            }
+        }
     }
 
     $empty.TraceGeo = @($rows)
+
+    $cgnatRows = @($rows | Where-Object { $_.Scope -eq 'CGNAT' })
+    $empty.CarrierNatHopCount = @($cgnatRows).Count
+    $empty.CarrierNatDetected = ($empty.CarrierNatHopCount -gt 0)
+
+    $pathScopes = [System.Collections.Generic.List[string]]::new()
+    foreach ($traceRow in @($rows | Sort-Object Hop)) {
+        $scope = [string]$traceRow.Scope
+        if ([string]::IsNullOrWhiteSpace($scope) -or $scope -eq 'VpnEndpoint') { continue }
+
+        if ($pathScopes.Count -eq 0 -or $pathScopes[$pathScopes.Count - 1] -ne $scope) {
+            $pathScopes.Add($scope)
+        }
+    }
+
+    if ($pathScopes.Count -gt 0) {
+        $empty.PathClass = @($pathScopes) -join ' -> '
+    }
+
+    if ($empty.CarrierNatDetected) {
+        $empty.UpstreamClass = 'CarrierNAT'
+    }
+    elseif (@($rows | Where-Object { $_.Scope -eq 'Public' }).Count -gt 0) {
+        $empty.UpstreamClass = 'PublicInternet'
+    }
+    elseif (@($rows).Count -gt 0) {
+        $empty.UpstreamClass = 'PrivateOrUnknown'
+    }
 
     $firstPublic = @(
         $rows |
@@ -8259,6 +10423,19 @@ function Get-WindowsVpnUnderlayAssessment {
     ) | Select-Object -First 1
 
     if ($null -eq $firstPublic) {
+        if ($socketBindingResolved) {
+            $empty.Status = 'ResolvedFromEstablishedSocket'
+            $empty.Detail = 'The established VPN socket proves physical underlay interface [{0}] (index {1}) with local IPv4 [{2}] and next hop [{3}]. No geolocatable public ICMP hop was observed; the interface binding remains authoritative. UpstreamClass=[{4}]; PathClass=[{5}]; CGNATHops={6}.' -f
+                $empty.InterfaceAlias,
+                $empty.InterfaceIndex,
+                $empty.LocalIPAddress,
+                $(if ([string]::IsNullOrWhiteSpace([string]$empty.NextHop)) { '<none>' } else { $empty.NextHop }),
+                $empty.UpstreamClass,
+                $empty.PathClass,
+                $empty.CarrierNatHopCount
+            return $empty
+        }
+
         $empty.Status = 'NoGeolocatableUnderlayHop'
         $empty.Detail = 'The VPN endpoint route uses non-VPN interface [{0}] (index {1}), but no geolocatable public hop was observed before the VPN endpoint.' -f
             $empty.InterfaceAlias,
@@ -8275,15 +10452,18 @@ function Get-WindowsVpnUnderlayAssessment {
     $empty.FirstPublicHopCountry = [string]$firstPublic.Country
     $empty.FirstPublicHopLatitude = [double]$firstPublic.Latitude
     $empty.FirstPublicHopLongitude = [double]$firstPublic.Longitude
-    $empty.Detail = 'Windows routed VPN endpoint [{0}] over non-VPN interface [{1}] (index {2}) via next hop [{3}]. First geolocatable public underlay hop [{4}] resolved to [{5}, {6}, {7}].' -f
+    $empty.Detail = 'VPN endpoint [{0}] is carried by physical interface [{1}] (index {2}) from local IPv4 [{3}] via next hop [{4}]. First geolocatable public underlay hop [{5}] resolved to [{6}, {7}, {8}]. Binding source=[{9}]; trace method=[{10}].' -f
         [string]$endpoint.IP,
         $empty.InterfaceAlias,
         $empty.InterfaceIndex,
+        $empty.LocalIPAddress,
         $(if ([string]::IsNullOrWhiteSpace([string]$empty.NextHop)) { '<none>' } else { $empty.NextHop }),
         [string]$firstPublic.IP,
         $(if ([string]::IsNullOrWhiteSpace([string]$firstPublic.City)) { '<unknown city>' } else { $firstPublic.City }),
         $(if ([string]::IsNullOrWhiteSpace([string]$firstPublic.Region)) { '<unknown region>' } else { $firstPublic.Region }),
-        $(if ([string]::IsNullOrWhiteSpace([string]$firstPublic.Country)) { '<unknown country>' } else { $firstPublic.Country })
+        $(if ([string]::IsNullOrWhiteSpace([string]$firstPublic.Country)) { '<unknown country>' } else { $firstPublic.Country }),
+        $(if ([string]::IsNullOrWhiteSpace([string]$empty.BindingSource)) { '<unknown>' } else { $empty.BindingSource }),
+        $(if ([string]::IsNullOrWhiteSpace([string]$empty.TraceMethod)) { '<none>' } else { $empty.TraceMethod })
 
     $empty.Location = [pscustomobject]@{
         Method         = 'WindowsVpnUnderlayTrace'
@@ -8292,21 +10472,25 @@ function Get-WindowsVpnUnderlayAssessment {
         AccuracyMeters = $null
         Site           = $null
         VpnResistant   = $true
-        Detail         = 'City-level physical-location heuristic from the first public ISP hop on the Windows route to the established VPN server. This is underlay evidence, not GPS, Wi-Fi positioning, or VPN-exit geolocation.'
+        Detail         = 'City-level carrier/ISP path heuristic from the first public hop observed on the source-bound Windows path to the established VPN server. This is network-path evidence, not GPS or Wi-Fi positioning.'
     }
 
     $underlayGeoText = @($firstPublic.City, $firstPublic.Region, $firstPublic.Country) |
         Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) }
 
-    Write-Verbose ('VPN underlay: status={0}; endpoint={1}; interface={2}; firstPublic={3}; geo={4}.' -f
+    Write-Verbose ('VPN underlay: status={0}; endpoint={1}; binding={2}; local={3}; interface={4}; trace={5}; firstPublic={6}; geo={7}.' -f
         $empty.Status,
         $empty.EndpointIP,
+        $empty.BindingSource,
+        $empty.LocalIPAddress,
         $empty.InterfaceAlias,
+        $empty.TraceMethod,
         $empty.FirstPublicHop,
         $(if (@($underlayGeoText).Count -gt 0) { @($underlayGeoText) -join ', ' } else { '<none>' }))
 
     return $empty
 }
+
 function Get-VpnTunnelIdentity {
     param(
         [Parameter(Mandatory)]
@@ -8589,6 +10773,13 @@ function Get-LocationConfidence {
 
     if ($Location.Method -eq 'PhysicalLocationUnresolved') { return 'None' }
     if ($Location.Method -eq 'WindowsVpnUnderlayTrace') { return 'Medium' }
+    if ($Location.Method -eq 'WiGLEBluetoothCluster') { return 'Medium' }
+    if ($Location.Method -eq 'LearnedBluetoothRfCluster') { return 'Medium' }
+    if ($Location.Method -eq 'UnderlayNetworkConsensus') { return 'Medium' }
+    if ($Location.Method -eq 'UnderlayIPv6') { return 'Low' }
+    if ($Location.Method -eq 'UnderlayDnsEcs') { return 'Low' }
+    if ($Location.Method -eq 'UnderlayEgressIP') { return 'Low' }
+    if ($Location.Method -eq 'CarrierEgressIP') { return 'Low' }
     if ($Location.Method -eq 'PublicIP') { return 'Low' }
     if ($Location.Method -eq 'WindowsGPS') { return 'High' }
     if ($Location.Method -eq 'KnownWiFi') { return 'High' }
@@ -8986,7 +11177,7 @@ $lines |
                         else {
                             [string]$mapUri
                         }
-            Detail    = 'Captured from the revised supplied GeoCoordinateWatcher script before the v3.65.3 workflow.'
+            Detail    = 'Captured from the revised supplied GeoCoordinateWatcher script before the v3.67.1 workflow.'
         }
     }
     catch {
@@ -11250,6 +13441,19 @@ if ($platform -eq 'Unknown') {
     throw 'Unable to identify the operating-system platform.'
 }
 
+$windowsLocationAccessInitial = if ($platform -eq 'Windows') {
+    Get-WindowsLocationAccessState
+}
+else {
+    $null
+}
+
+$windowsLocationSystemBlocked = (
+    $platform -eq 'Windows' -and
+    $null -ne $windowsLocationAccessInitial -and
+    $windowsLocationAccessInitial.EffectiveState -in @('BlockedBySystemGlobal', 'BlockedByPolicy')
+)
+
 # v3.20 comparison baseline: run the revised supplied OG script first. Snapshot/restore Location
 # consent around that execution because the original script leaves its temporary Allow
 # values in place (its Deny cleanup is commented out).
@@ -11265,14 +13469,23 @@ $ogDeviceCoords = [pscustomobject]@{
 $ogConsentSnapshot = @()
 
 if ($platform -eq 'Windows') {
-    try {
-        $ogConsentSnapshot = @(Enable-WindowsTemporaryLocationConsent)
-        Write-Verbose 'Running revised OG Get-DeviceCoords script before the v3.65.3 workflow.'
-        $ogDeviceCoords = Invoke-OgDeviceCoordsScript -Platform $platform
+    if ($windowsLocationSystemBlocked) {
+        $ogDeviceCoords.Detail = 'Skipped because Windows Location effective state is [{0}]. {1}' -f
+            $windowsLocationAccessInitial.EffectiveState,
+            $windowsLocationAccessInitial.Detail
+        Write-Verbose ('OG location: skipped; Windows Location effective state={0}.' -f
+            $windowsLocationAccessInitial.EffectiveState)
     }
-    finally {
-        if (@($ogConsentSnapshot).Count -gt 0) {
-            Restore-WindowsLocationConsent -Snapshot $ogConsentSnapshot
+    else {
+        try {
+            $ogConsentSnapshot = @(Enable-WindowsTemporaryLocationConsent)
+            Write-Verbose 'Running revised OG Get-DeviceCoords script before the v3.67.1 workflow.'
+            $ogDeviceCoords = Invoke-OgDeviceCoordsScript -Platform $platform
+        }
+        finally {
+            if (@($ogConsentSnapshot).Count -gt 0) {
+                Restore-WindowsLocationConsent -Snapshot $ogConsentSnapshot
+            }
         }
     }
 }
@@ -11345,6 +13558,10 @@ $bluetoothOutputEnabled = $bluetoothResultsForced
 $consentSnapshot = @()
 $consentTemporarilyChanged = $false
 $notes = [System.Collections.Generic.List[string]]::new()
+
+if ($windowsLocationSystemBlocked) {
+    $notes.Add($windowsLocationAccessInitial.Detail)
+}
 
 $initialConsent = if ($platform -eq 'Windows') {
     Get-WindowsCurrentLocationConsentValue
@@ -11424,12 +13641,34 @@ $gpsProbe = [pscustomobject]@{
 }
 $gpsLocation = $null
 
+$rfLocationMode = 'Normal'
+$rfLocationTrigger = 'None'
+$rfFusionStatus = 'NotRequired'
+$rfFusionMethod = 'None'
+$wigleBluetoothResolverStatus = 'NotAttempted'
+$wigleBluetoothLocation = $null
+$underlayStunAssessment = $null
+$underlayStunGeo = $null
+$underlayIpv6Assessment = $null
+$underlayDnsAssessment = $null
+$learnedRfAnchorAssessment = $null
+$rfAnchorLearningResult = $null
+$connectionScenario = 'Standard'
+$connectionScenarioClass = 'Standard'
+$connectionScenarioConfidence = 'High'
+$connectionScenarioBasis = 'Normal resolver path'
+$cellularGenerationEvidence = 'NotApplicable'
+
 try {
     # Only front-load a high-accuracy satellite probe when Windows exposes explicit
     # GPS/GNSS hardware evidence. If this detector misses an integrated receiver,
     # the normal Windows native-location stage below still uses WinRT and can identify
     # PositionSource=Satellite later.
-    if ($platform -eq 'Windows' -and $gpsHardwareDetected) {
+    if ($platform -eq 'Windows' -and $gpsHardwareDetected -and $windowsLocationSystemBlocked) {
+        $gpsProbe.Status = 'BlockedBySystemLocation'
+        $gpsProbe.Detail = $windowsLocationAccessInitial.Detail
+    }
+    elseif ($platform -eq 'Windows' -and $gpsHardwareDetected) {
         if ($initialConsent -ne 'Allow' -and
             -not $NoTemporaryLocationConsent) {
 
@@ -11456,7 +13695,14 @@ try {
 
     # Only ask the WLAN stack to scan when a Wi-Fi interface is actually present.
     if ($deviceProfile.WifiInterfacePresent) {
-        $wifiScan = Get-NearbyWifiAccessPoint
+        if ($platform -eq 'Windows' -and $windowsLocationSystemBlocked) {
+            $wifiScan = New-SkippedWifiScanResult `
+                -Status 'BlockedBySystemLocation' `
+                -Reason $windowsLocationAccessInitial.Detail
+        }
+        else {
+            $wifiScan = Get-NearbyWifiAccessPoint
+        }
     }
     else {
         $wifiScan = New-SkippedWifiScanResult `
@@ -11472,6 +13718,7 @@ try {
     # Windows can expose BSSID data only after Location permission is available.
     # Never attempt registry privacy changes on Linux or macOS.
     if ($platform -eq 'Windows' -and
+        -not $windowsLocationSystemBlocked -and
         $deviceProfile.WifiInterfacePresent -and
         @($wifiScan.AccessPoints).Count -eq 0 -and
         -not $consentTemporarilyChanged -and
@@ -11664,34 +13911,39 @@ try {
     }
 
     if ($null -eq $physicalLocation) {
-        $nativeLocationStatus = 'Attempted'
-        $nativeLocationCandidate = Get-NativePhysicalLocation -Timeout $TimeoutSeconds
-        $physicalLocation = $nativeLocationCandidate
-
-        if ($null -ne $physicalLocation) {
-            $nativeLocationStatus = 'Resolved'
+        if ($platform -eq 'Windows' -and $windowsLocationSystemBlocked) {
+            $nativeLocationStatus = 'BlockedBySystemLocation'
         }
         else {
-            $nativeLocationStatus = 'NoFix'
-        }
+            $nativeLocationStatus = 'Attempted'
+            $nativeLocationCandidate = Get-NativePhysicalLocation -Timeout $TimeoutSeconds
+            $physicalLocation = $nativeLocationCandidate
 
-        # One additional Windows attempt after temporary consent, if we did not already
-        # change consent for the Wi-Fi scan.
-        if ($platform -eq 'Windows' -and
-            $null -eq $physicalLocation -and
-            -not $consentTemporarilyChanged -and
-            -not $NoTemporaryLocationConsent) {
+            if ($null -ne $physicalLocation) {
+                $nativeLocationStatus = 'Resolved'
+            }
+            else {
+                $nativeLocationStatus = 'NoFix'
+            }
 
-            $consentSnapshot = @(Enable-WindowsTemporaryLocationConsent)
+            # One additional Windows attempt after temporary consent, if we did not already
+            # change consent for the Wi-Fi scan.
+            if ($platform -eq 'Windows' -and
+                $null -eq $physicalLocation -and
+                -not $consentTemporarilyChanged -and
+                -not $NoTemporaryLocationConsent) {
 
-            if (@($consentSnapshot).Count -gt 0) {
-                $consentTemporarilyChanged = $true
-                Start-Sleep -Milliseconds 300
-                $nativeLocationCandidate = Get-NativePhysicalLocation -Timeout $TimeoutSeconds
-                $physicalLocation = $nativeLocationCandidate
+                $consentSnapshot = @(Enable-WindowsTemporaryLocationConsent)
 
-                if ($null -ne $physicalLocation) {
-                    $nativeLocationStatus = 'ResolvedAfterTemporaryConsent'
+                if (@($consentSnapshot).Count -gt 0) {
+                    $consentTemporarilyChanged = $true
+                    Start-Sleep -Milliseconds 300
+                    $nativeLocationCandidate = Get-NativePhysicalLocation -Timeout $TimeoutSeconds
+                    $physicalLocation = $nativeLocationCandidate
+
+                    if ($null -ne $physicalLocation) {
+                        $nativeLocationStatus = 'ResolvedAfterTemporaryConsent'
+                    }
                 }
             }
         }
@@ -11742,6 +13994,130 @@ try {
             $physicalLocation.Longitude)
     }
 
+    # RF Location Fusion is an exception path. Normal resolvers above always win.
+    # Activate only when a Wi-Fi-capable endpoint still has no physical coordinate.
+    # This deliberately covers both VPN and non-VPN Wi-Fi edge cases.
+    if (
+        -not $DisableRfFusion -and
+        $null -eq $physicalLocation -and
+        $deviceProfile.WifiInterfacePresent
+    ) {
+        $rfLocationMode = 'EdgeRfRecovery'
+
+        if ($platform -eq 'Windows' -and $windowsLocationSystemBlocked) {
+            $rfLocationTrigger = 'WindowsLocationAndBssidBlocked'
+        }
+        elseif (@($establishedVpnEvidence).Count -gt 0) {
+            $rfLocationTrigger = 'EndpointVpnPhysicalLocationUnresolved'
+        }
+        elseif (@($wifiAccessPoints).Count -eq 0) {
+            $rfLocationTrigger = 'WifiPresentNoRfCoordinates'
+        }
+        else {
+            $rfLocationTrigger = 'WifiResolversExhausted'
+        }
+
+        $rfFusionStatus = 'Activated'
+
+        # Keep normal runs fast: passive BLE is started automatically only after the
+        # edge condition above is proven. Existing explicit Bluetooth scans are reused.
+        if (-not $SkipBluetooth -and @($bluetoothDevices).Count -eq 0) {
+            Write-Verbose ('RF Location Fusion activated: trigger={0}; starting {1}s passive BLE scan.' -f
+                $rfLocationTrigger,
+                $RfFusionBluetoothScanSeconds)
+
+            $bluetoothScan = Get-BluetoothLeEvidence `
+                -ScanSeconds $RfFusionBluetoothScanSeconds
+            $bluetoothEvidenceScanSeconds = $RfFusionBluetoothScanSeconds
+            $bluetoothDevices = @($bluetoothScan.Devices)
+            $bluetoothDeviceCount = @($bluetoothDevices).Count
+            $bluetoothOutputEnabled = $true
+
+            if (-not [string]::IsNullOrWhiteSpace([string]$BluetoothMapPath) -and
+                $bluetoothDevices.Count -gt 0) {
+
+                $bluetoothAnchorLocation = Get-KnownBluetoothLocation `
+                    -Devices $bluetoothDevices `
+                    -Path $BluetoothMapPath
+            }
+        }
+
+        if ($null -eq $physicalLocation -and $null -ne $bluetoothAnchorLocation) {
+            $physicalLocation = $bluetoothAnchorLocation
+            $rfFusionStatus = 'Resolved'
+            $rfFusionMethod = 'KnownBluetooth'
+        }
+
+        if (
+            $null -eq $physicalLocation -and
+            -not $DisableRfAnchorLearning -and
+            @($bluetoothDevices).Count -gt 0
+        ) {
+            $learnedRfAnchorAssessment = Get-LearnedBluetoothRfLocation -Devices $bluetoothDevices
+
+            if ($null -ne $learnedRfAnchorAssessment.Location) {
+                $physicalLocation = $learnedRfAnchorAssessment.Location
+                $rfFusionStatus = 'Resolved'
+                $rfFusionMethod = 'LearnedBluetoothRfCluster'
+                $notes.Add(
+                    ('RF Location Fusion matched {0} matured locally learned hashed BLE anchors (Trusted={1}; RF score={2}; cluster radius={3} km); no carrier/VPN egress geolocation was required.' -f
+                        $learnedRfAnchorAssessment.MatchCount,
+                        $learnedRfAnchorAssessment.TrustedCount,
+                        $learnedRfAnchorAssessment.RfScore,
+                        $learnedRfAnchorAssessment.ClusterRadiusKm)
+                )
+            }
+        }
+
+        if (
+            $null -eq $physicalLocation -and
+            @($bluetoothDevices).Count -gt 0 -and
+            $wigleResolverOutputEnabled
+        ) {
+            $wigleBluetoothResolverStatus = 'Attempted'
+
+            $wigleBluetoothLocation = Get-WigleBluetoothRfLocation `
+                -Devices $bluetoothDevices `
+                -ApiName $WigleApiName `
+                -ApiToken $WigleApiToken `
+                -MaxLiveLookups $MaxWigleBluetoothLookupsPerRun
+
+            if ($null -ne $wigleBluetoothLocation) {
+                $physicalLocation = $wigleBluetoothLocation
+                $wigleBluetoothResolverStatus = 'Resolved'
+                $rfFusionStatus = 'Resolved'
+                $rfFusionMethod = 'WiGLEBluetoothCluster'
+
+                $notes.Add(
+                    ('RF Location Fusion recovered a VPN-resistant physical neighbourhood from {0} clustered public BLE anchors.' -f
+                        $wigleBluetoothLocation.BluetoothClusterCount)
+                )
+            }
+            elseif ($script:WigleBluetoothLastHttpStatus -eq 401) {
+                $wigleBluetoothResolverStatus = 'AuthenticationFailedHttp401'
+            }
+            elseif ($script:WigleBluetoothLastHttpStatus -eq 403) {
+                $wigleBluetoothResolverStatus = 'ForbiddenHttp403'
+            }
+            elseif ($script:WigleBluetoothLastHttpStatus -eq 429) {
+                $wigleBluetoothResolverStatus = 'RateLimitedHttp429'
+            }
+            elseif ($script:WigleBluetoothMatchCount -gt 0) {
+                $wigleBluetoothResolverStatus = 'NoStableCluster'
+            }
+            else {
+                $wigleBluetoothResolverStatus = 'NoMatch'
+            }
+        }
+        elseif ($null -eq $physicalLocation -and -not $wigleResolverOutputEnabled) {
+            $wigleBluetoothResolverStatus = 'SkippedNoCredentials'
+        }
+
+        if ($null -eq $physicalLocation -and $rfFusionStatus -eq 'Activated') {
+            $rfFusionStatus = 'NoRfFix'
+        }
+    }
+
     $publicIpLocation = $null
 
     if (-not $SkipPublicIpLookup) {
@@ -11771,30 +14147,367 @@ try {
 
     $windowsVpnUnderlayAssessment = $null
     $windowsVpnUnderlayLocation = $null
+    $windowsVpnUnderlayNearestMajorCity = $null
 
-    if ($windowsEndpointVpnEstablished -and $null -eq $physicalLocation) {
+    # Always collect Windows VPN-underlay evidence when an endpoint VPN is
+    # established. If a higher-quality physical resolver already succeeded,
+    # underlay evidence is network-path context only and must not replace it.
+    if ($windowsEndpointVpnEstablished) {
         $windowsVpnUnderlayAssessment = Get-WindowsVpnUnderlayAssessment `
             -TunnelDetails $establishedVpnTunnelDetails `
             -RouterWan $routerWanDiscovery
 
+        if (
+            $null -ne $windowsVpnUnderlayAssessment -and
+            $windowsVpnUnderlayAssessment.Status -eq 'Resolved' -and
+            $null -ne $windowsVpnUnderlayAssessment.FirstPublicHopLatitude -and
+            $null -ne $windowsVpnUnderlayAssessment.FirstPublicHopLongitude
+        ) {
+            $windowsVpnUnderlayNearestMajorCity = Resolve-CanadianMajorCityLocal `
+                -Latitude ([double]$windowsVpnUnderlayAssessment.FirstPublicHopLatitude) `
+                -Longitude ([double]$windowsVpnUnderlayAssessment.FirstPublicHopLongitude)
+        }
+
         if ($null -ne $windowsVpnUnderlayAssessment.Location) {
             $windowsVpnUnderlayLocation = $windowsVpnUnderlayAssessment.Location
-            $physicalLocation = $windowsVpnUnderlayLocation
 
+            if ($null -eq $physicalLocation) {
+                $physicalLocation = $windowsVpnUnderlayLocation
+                $notes.Add(
+                    ('VPN egress separated from physical underlay; first public hop={0} via {1}. Underlay geolocation is a network-path heuristic.' -f
+                        $windowsVpnUnderlayAssessment.FirstPublicHop,
+                        $windowsVpnUnderlayAssessment.InterfaceAlias)
+                )
+            }
+            else {
+                Write-Verbose ('VPN underlay collected as network-path context; selected physical location remains [{0}].' -f
+                    $physicalLocation.Method)
+            }
+        }
+        elseif ($windowsVpnUnderlayAssessment.Status -eq 'ResolvedFromEstablishedSocket') {
             $notes.Add(
-                ('VPN egress separated from physical underlay; first public hop={0} via {1}.' -f
-                    $windowsVpnUnderlayAssessment.FirstPublicHop,
-                    $windowsVpnUnderlayAssessment.InterfaceAlias)
+                ('An endpoint VPN is established. Public-IP geolocation is treated as VPN egress only. The established VPN socket proves underlay interface [{0}] with local IPv4 [{1}] via next hop [{2}], but no geolocatable public ICMP hop was observed.' -f
+                    $windowsVpnUnderlayAssessment.InterfaceAlias,
+                    $windowsVpnUnderlayAssessment.LocalIPAddress,
+                    $(if ([string]::IsNullOrWhiteSpace([string]$windowsVpnUnderlayAssessment.NextHop)) { '<none>' } else { $windowsVpnUnderlayAssessment.NextHop }))
             )
         }
         else {
             $notes.Add(
-                ('An endpoint VPN is established. Public-IP geolocation is treated as VPN egress only. Windows underlay physical-location inference did not resolve: status={0}; detail={1}' -f
+                ('An endpoint VPN is established. Public-IP geolocation is treated as VPN egress only. Windows underlay path collection did not resolve: status={0}; detail={1}' -f
                     $windowsVpnUnderlayAssessment.Status,
                     $windowsVpnUnderlayAssessment.Detail)
             )
         }
     }
+
+    # Classify the network topology separately from location selection.
+    # VPNover5G is an operational edge-case label for the strong topology pattern:
+    # endpoint VPN + Wi-Fi physical underlay + carrier-grade NAT immediately upstream.
+    # Windows cannot directly observe the phone's LTE/5G radio generation, so that
+    # limitation is carried explicitly in CellularGenerationEvidence.
+    $windowsVpnUnderlayTransport = 'Unknown'
+
+    if (
+        $windowsEndpointVpnEstablished -and
+        $null -ne $windowsVpnUnderlayAssessment -and
+        -not [string]::IsNullOrWhiteSpace([string]$windowsVpnUnderlayAssessment.InterfaceAlias)
+    ) {
+        if (
+            $null -ne $routerWanDiscovery -and
+            [string]$routerWanDiscovery.InterfaceAlias -eq [string]$windowsVpnUnderlayAssessment.InterfaceAlias -and
+            -not [string]::IsNullOrWhiteSpace([string]$routerWanDiscovery.InterfaceType)
+        ) {
+            $windowsVpnUnderlayTransport = [string]$routerWanDiscovery.InterfaceType
+        }
+        elseif ([string]$windowsVpnUnderlayAssessment.InterfaceAlias -match '(?i)wi-?fi|wlan|wireless') {
+            $windowsVpnUnderlayTransport = 'WiFi'
+        }
+    }
+
+    if (
+        $windowsEndpointVpnEstablished -and
+        $windowsVpnUnderlayTransport -eq 'WiFi' -and
+        $null -ne $windowsVpnUnderlayAssessment -and
+        [bool]$windowsVpnUnderlayAssessment.CarrierNatDetected
+    ) {
+        $connectionScenario = 'VPNover5G'
+        $connectionScenarioClass = 'VPNoverCellularHotspot'
+        $connectionScenarioConfidence = 'High'
+        $connectionScenarioBasis = 'Established endpoint VPN + proven Wi-Fi underlay + immediate carrier-grade NAT path'
+        $cellularGenerationEvidence = 'Cellular hotspot strongly indicated; LTE versus 5G radio generation is not directly observable from the Windows endpoint'
+    }
+    elseif ($windowsEndpointVpnEstablished -and $windowsVpnUnderlayTransport -eq 'WiFi') {
+        $connectionScenario = 'VPNoverWiFi'
+        $connectionScenarioClass = 'VPNoverWiFi'
+        $connectionScenarioConfidence = 'High'
+        $connectionScenarioBasis = 'Established endpoint VPN with proven Wi-Fi physical underlay'
+        $cellularGenerationEvidence = 'No carrier-NAT signature observed'
+    }
+    elseif ($windowsEndpointVpnEstablished) {
+        $connectionScenario = 'VPN'
+        $connectionScenarioClass = 'EndpointVPN'
+        $connectionScenarioConfidence = 'High'
+        $connectionScenarioBasis = 'Established endpoint VPN'
+        $cellularGenerationEvidence = 'NotApplicable'
+    }
+    elseif ($deviceProfile.WifiInterfacePresent) {
+        $connectionScenario = 'WiFi'
+        $connectionScenarioClass = 'WiFi'
+        $connectionScenarioConfidence = 'High'
+        $connectionScenarioBasis = 'Wi-Fi interface present; no established endpoint VPN'
+        $cellularGenerationEvidence = 'NotApplicable'
+    }
+
+    # v3.67.1 underlay-locality recovery. This is generic Wi-Fi edge recovery:
+    # it runs only after normal physical resolvers failed. With an endpoint VPN, the
+    # established VPN socket is authoritative for the physical interface. Without a
+    # VPN, the physical default-gateway interface is used. IPv6 is checked before IPv4
+    # egress because a tether/router may pass a globally routable SLAAC prefix even
+    # when IPv4 is NATed. Local DNS/ECS is queried only via an underlay-local resolver.
+    $edgeUnderlayInterfaceAlias = $null
+    $edgeUnderlayInterfaceIndex = $null
+    $edgeUnderlayGateway = $null
+
+    if (
+        $windowsEndpointVpnEstablished -and
+        $windowsVpnUnderlayTransport -eq 'WiFi' -and
+        $null -ne $windowsVpnUnderlayAssessment -and
+        $null -ne $windowsVpnUnderlayAssessment.InterfaceIndex
+    ) {
+        $edgeUnderlayInterfaceAlias = [string]$windowsVpnUnderlayAssessment.InterfaceAlias
+        $edgeUnderlayInterfaceIndex = [int]$windowsVpnUnderlayAssessment.InterfaceIndex
+        $edgeUnderlayGateway = [string]$windowsVpnUnderlayAssessment.NextHop
+    }
+    elseif (
+        $platform -eq 'Windows' -and
+        $rfLocationMode -eq 'EdgeRfRecovery' -and
+        $deviceProfile.WifiInterfacePresent -and
+        $null -ne $routerWanDiscovery -and
+        [string]$routerWanDiscovery.InterfaceType -eq 'WiFi' -and
+        -not [string]::IsNullOrWhiteSpace([string]$routerWanDiscovery.InterfaceAlias)
+    ) {
+        try {
+            $edgeAdapter = Get-NetAdapter `
+                -Name ([string]$routerWanDiscovery.InterfaceAlias) `
+                -ErrorAction Stop |
+                Select-Object -First 1
+
+            if ($null -ne $edgeAdapter) {
+                $edgeUnderlayInterfaceAlias = [string]$edgeAdapter.InterfaceAlias
+                $edgeUnderlayInterfaceIndex = [int]$edgeAdapter.InterfaceIndex
+                $edgeUnderlayGateway = [string]$routerWanDiscovery.Gateway
+            }
+        }
+        catch { }
+    }
+
+    if (
+        -not $DisableRfFusion -and
+        $platform -eq 'Windows' -and
+        $rfLocationMode -eq 'EdgeRfRecovery' -and
+        $null -eq $physicalLocation -and
+        $deviceProfile.WifiInterfacePresent -and
+        $null -ne $edgeUnderlayInterfaceIndex
+    ) {
+        $underlayIpv6Assessment = Get-WindowsUnderlayIpv6Assessment `
+            -InterfaceIndex ([int]$edgeUnderlayInterfaceIndex) `
+            -InterfaceAlias ([string]$edgeUnderlayInterfaceAlias)
+
+        Write-Verbose ('RF Location Fusion: underlay IPv6 status={0}; address={1}; clientGeo={2}; firstGlobalHop={3}; traceGeo={4}.' -f
+            $underlayIpv6Assessment.Status,
+            $(if ([string]::IsNullOrWhiteSpace([string]$underlayIpv6Assessment.Address)) { '<none>' } else { $underlayIpv6Assessment.Address }),
+            $(if ($null -eq $underlayIpv6Assessment.ClientGeo) { '<none>' } else { '{0}, {1}' -f $underlayIpv6Assessment.ClientGeo.City, $underlayIpv6Assessment.ClientGeo.Region }),
+            $(if ([string]::IsNullOrWhiteSpace([string]$underlayIpv6Assessment.FirstGlobalHop)) { '<none>' } else { $underlayIpv6Assessment.FirstGlobalHop }),
+            $(if ($null -eq $underlayIpv6Assessment.FirstGlobalHopGeo) { '<none>' } else { '{0}, {1}' -f $underlayIpv6Assessment.FirstGlobalHopGeo.City, $underlayIpv6Assessment.FirstGlobalHopGeo.Region }))
+
+        $underlayDnsAssessment = Get-WindowsUnderlayDnsLocalityAssessment `
+            -InterfaceIndex ([int]$edgeUnderlayInterfaceIndex) `
+            -DefaultGateway ([string]$edgeUnderlayGateway)
+
+        Write-Verbose ('RF Location Fusion: underlay DNS status={0}; servers={1}; ECS={2}; resolver={3}.' -f
+            $underlayDnsAssessment.Status,
+            $(if (@($underlayDnsAssessment.DnsServers).Count -eq 0) { '<none>' } else { @($underlayDnsAssessment.DnsServers) -join ',' }),
+            $(if ([string]::IsNullOrWhiteSpace([string]$underlayDnsAssessment.EcsSubnet)) { '<none>' } else { $underlayDnsAssessment.EcsSubnet }),
+            $(if ([string]::IsNullOrWhiteSpace([string]$underlayDnsAssessment.ResolverPublicIp)) { '<none>' } else { $underlayDnsAssessment.ResolverPublicIp }))
+
+        if ($null -eq $physicalLocation) {
+            $ipv6Geo = if ($null -ne $underlayIpv6Assessment.ClientGeo) {
+                $underlayIpv6Assessment.ClientGeo
+            }
+            elseif ($null -ne $underlayIpv6Assessment.FirstGlobalHopGeo) {
+                $underlayIpv6Assessment.FirstGlobalHopGeo
+            }
+            else {
+                $null
+            }
+
+            $dnsEcsGeo = if ($null -ne $underlayDnsAssessment.EcsGeo) {
+                $underlayDnsAssessment.EcsGeo
+            }
+            else {
+                $null
+            }
+
+            $ipv6CityKey = if ($null -ne $ipv6Geo) {
+                ('{0}|{1}' -f ([string]$ipv6Geo.City).Trim().ToLowerInvariant(), ([string]$ipv6Geo.Region).Trim().ToLowerInvariant())
+            }
+            else { '' }
+
+            $dnsCityKey = if ($null -ne $dnsEcsGeo) {
+                ('{0}|{1}' -f ([string]$dnsEcsGeo.City).Trim().ToLowerInvariant(), ([string]$dnsEcsGeo.Region).Trim().ToLowerInvariant())
+            }
+            else { '' }
+
+            if (
+                $null -ne $ipv6Geo -and
+                $null -ne $dnsEcsGeo -and
+                -not [string]::IsNullOrWhiteSpace($ipv6CityKey) -and
+                $ipv6CityKey -eq $dnsCityKey
+            ) {
+                $physicalLocation = [pscustomobject]@{
+                    Method         = 'UnderlayNetworkConsensus'
+                    Latitude       = ([double]$ipv6Geo.Latitude + [double]$dnsEcsGeo.Latitude) / 2.0
+                    Longitude      = ([double]$ipv6Geo.Longitude + [double]$dnsEcsGeo.Longitude) / 2.0
+                    AccuracyMeters = 15000
+                    Site           = $null
+                    VpnResistant   = $true
+                    Detail         = ('Physical-underlay network consensus: global IPv6 and local-DNS ECS independently geolocate to {0}, {1}. This remains network-locality evidence rather than GPS.' -f $ipv6Geo.City, $ipv6Geo.Region)
+                }
+                $rfFusionStatus = 'Resolved'
+                $rfFusionMethod = 'UnderlayNetworkConsensus'
+            }
+            elseif ($null -ne $ipv6Geo) {
+                $physicalLocation = [pscustomobject]@{
+                    Method         = 'UnderlayIPv6'
+                    Latitude       = [double]$ipv6Geo.Latitude
+                    Longitude      = [double]$ipv6Geo.Longitude
+                    AccuracyMeters = 20000
+                    Site           = $null
+                    VpnResistant   = $true
+                    Detail         = ('Globally routable IPv6 observed directly on the proven physical Wi-Fi underlay and geolocated independently of VPN IPv4 egress. This is a low-confidence carrier-prefix locality heuristic.')
+                }
+                $rfFusionStatus = 'Resolved'
+                $rfFusionMethod = 'UnderlayIPv6'
+            }
+            elseif ($null -ne $dnsEcsGeo) {
+                $physicalLocation = [pscustomobject]@{
+                    Method         = 'UnderlayDnsEcs'
+                    Latitude       = [double]$dnsEcsGeo.Latitude
+                    Longitude      = [double]$dnsEcsGeo.Longitude
+                    AccuracyMeters = 25000
+                    Site           = $null
+                    VpnResistant   = $true
+                    Detail         = ('A DNS resolver attached to the proven physical Wi-Fi underlay exposed EDNS Client Subnet [{0}], geolocated independently of VPN egress. This is a low-confidence network-locality heuristic.' -f $underlayDnsAssessment.EcsSubnet)
+                }
+                $rfFusionStatus = 'Resolved'
+                $rfFusionMethod = 'UnderlayDnsEcs'
+            }
+        }
+    }
+
+    # Last-resort VPN-over-Wi-Fi recovery. A source-bound STUN request is sent
+    # only in edge mode and only through the already-proven non-VPN Wi-Fi underlay
+    # interface. This can reveal the real ISP/carrier-facing NAT IP while the normal
+    # public IP remains the VPN egress. VPNover5G is a specialized topology label;
+    # this recovery also applies to ordinary home/hotel/corporate Wi-Fi + VPN.
+    if (
+        -not $DisableRfFusion -and
+        -not $DisableUnderlayStunProbe -and
+        ($null -eq $physicalLocation -or [string]$physicalLocation.Method -in @('UnderlayIPv6','UnderlayDnsEcs','UnderlayNetworkConsensus')) -and
+        $windowsEndpointVpnEstablished -and
+        $windowsVpnUnderlayTransport -eq 'WiFi' -and
+        $null -ne $windowsVpnUnderlayAssessment -and
+        -not [string]::IsNullOrWhiteSpace([string]$windowsVpnUnderlayAssessment.LocalIPAddress) -and
+        $null -ne $windowsVpnUnderlayAssessment.InterfaceIndex
+    ) {
+        Write-Verbose ('RF Location Fusion: probing physical-underlay public IP from {0}/{1}.' -f
+            $windowsVpnUnderlayAssessment.InterfaceAlias,
+            $windowsVpnUnderlayAssessment.LocalIPAddress)
+
+        $underlayStunAssessment = Get-SourceBoundUnderlayPublicIp `
+            -LocalIPAddress ([string]$windowsVpnUnderlayAssessment.LocalIPAddress) `
+            -InterfaceIndex ([int]$windowsVpnUnderlayAssessment.InterfaceIndex)
+
+        if ($null -ne $underlayStunAssessment) {
+            Write-Verbose ('RF Location Fusion: underlay STUN status={0}; stage={1}; pinApplied={2}; server={3}; localSocket={4}; error={5}' -f
+                $underlayStunAssessment.Status,
+                $underlayStunAssessment.Stage,
+                $underlayStunAssessment.InterfacePinApplied,
+                $underlayStunAssessment.Server,
+                $underlayStunAssessment.LocalSocketEndpoint,
+                $(if ([string]::IsNullOrWhiteSpace([string]$underlayStunAssessment.Error)) { '<none>' } else { $underlayStunAssessment.Error }))
+        }
+
+        if (
+            $null -ne $underlayStunAssessment -and
+            $underlayStunAssessment.Status -eq 'Resolved' -and
+            (Test-PublicIpv4Address -IPAddress ([string]$underlayStunAssessment.PublicIPAddress))
+        ) {
+            # A supposedly underlay-bound probe that returns the same address as the
+            # VPN-visible public IP did not prove independent egress. Never promote it.
+            if (
+                $null -ne $publicIpLocation -and
+                [string]$underlayStunAssessment.PublicIPAddress -eq [string]$publicIpLocation.IP
+            ) {
+                $underlayStunAssessment.Status = 'MatchedVpnEgress'
+                $underlayStunAssessment.Error = 'Source-bound STUN returned the same public IP as the VPN egress; independent underlay egress was not proven.'
+                Write-Verbose ('RF Location Fusion: source-bound STUN matched VPN egress [{0}]; underlay location fallback rejected.' -f
+                    $underlayStunAssessment.PublicIPAddress)
+            }
+            else {
+                $underlayStunGeo = Get-IpLocationByAddress `
+                    -IPAddress ([string]$underlayStunAssessment.PublicIPAddress)
+            }
+
+            if (
+                $null -ne $underlayStunGeo -and
+                $null -ne $underlayStunGeo.Latitude -and
+                $null -ne $underlayStunGeo.Longitude
+            ) {
+                if ($null -eq $physicalLocation) {
+                    $physicalLocation = [pscustomobject]@{
+                    Method         = 'UnderlayEgressIP'
+                    Latitude       = [double]$underlayStunGeo.Latitude
+                    Longitude      = [double]$underlayStunGeo.Longitude
+                    AccuracyMeters = 25000
+                    Site           = $null
+                    VpnResistant   = $true
+                    Detail         = ('RF Location Fusion source-bound STUN recovered underlay public IP [{0}] via physical interface [{1}]. Underlay egress geolocation is a low-confidence city/region heuristic and is independent of VPN egress [{2}].' -f
+                                        $underlayStunAssessment.PublicIPAddress,
+                                        $windowsVpnUnderlayAssessment.InterfaceAlias,
+                                        $(if ($null -ne $publicIpLocation) { $publicIpLocation.IP } else { '<not-collected>' }))
+                }
+
+                $rfLocationMode = 'EdgeRfRecovery'
+                $rfLocationTrigger = if ($connectionScenarioClass -eq 'VPNoverCellularHotspot') {
+                    'VPNover5GPhysicalLocationUnresolved'
+                }
+                else {
+                    'VPNoverWiFiPhysicalLocationUnresolved'
+                }
+                $rfFusionStatus = 'Resolved'
+                $rfFusionMethod = 'UnderlayEgressIP'
+
+                $notes.Add(
+                    ('RF Location Fusion recovered physical-underlay egress [{0}] ({1}, {2}) independently of VPN egress. This is a low-confidence ISP/carrier-network location heuristic.' -f
+                        $underlayStunAssessment.PublicIPAddress,
+                        $underlayStunGeo.City,
+                        $underlayStunGeo.Region)
+                )
+                }
+                else {
+                    $notes.Add(
+                        ('RF Location Fusion also recovered physical-underlay IPv4 egress [{0}] ({1}, {2}) as supporting carrier/ISP context; selected location remains [{3}].' -f
+                            $underlayStunAssessment.PublicIPAddress,
+                            $underlayStunGeo.City,
+                            $underlayStunGeo.Region,
+                            $physicalLocation.Method)
+                    )
+                }
+            }
+            }
+        }
 
     $selectedLocation = $physicalLocation
 
@@ -11925,8 +14638,29 @@ try {
         -ObservedPublicIp $publicIpLocation `
         -EndpointVpnEstablished $vpnTunnelEstablished
 
+    # TraceGeo is the best analyst-facing network-path trace available.
+    # Router-path evidence remains authoritative for RouterVpnAssessment. When an
+    # endpoint VPN intentionally suppresses that trace, surface the separately
+    # proven VPN-underlay path without changing router-VPN attribution.
+    $traceGeoSource = 'None'
+    $traceGeoSourceRows = @()
+
+    if (@($routerVpnAssessment.TraceGeo).Count -gt 0) {
+        $traceGeoSource = 'RouterPath'
+        $traceGeoSourceRows = @($routerVpnAssessment.TraceGeo)
+    }
+    elseif (
+        $platform -eq 'Windows' -and
+        $vpnTunnelEstablished -and
+        $null -ne $windowsVpnUnderlayAssessment -and
+        @($windowsVpnUnderlayAssessment.TraceGeo).Count -gt 0
+    ) {
+        $traceGeoSource = 'WindowsVpnUnderlay'
+        $traceGeoSourceRows = @($windowsVpnUnderlayAssessment.TraceGeo)
+    }
+
     $traceGeoRows = @(
-        @($routerVpnAssessment.TraceGeo) |
+        $traceGeoSourceRows |
             Sort-Object Hop |
             ForEach-Object {
                 [pscustomobject][ordered]@{
@@ -11968,6 +14702,45 @@ try {
                 $routerVpnAssessment.Suspected,
                 $routerVpnAssessment.Confidence)
         )
+    }
+
+    # Learn hashed public-BLE anchors only from trustworthy physical fixes. This is
+    # local-only state: raw BLE MAC addresses are never written to disk. It allows a
+    # later Location-off edge run to recognize a previously learned RF neighbourhood.
+    if (-not $DisableRfAnchorLearning -and @($bluetoothDevices).Count -gt 0) {
+        $learnableMethods = @(
+            'WindowsGPS',
+            'KnownWiFi',
+            'KnownBluetooth',
+            'GoogleWiFi',
+            'WiGLEWiFi',
+            'WindowsLocation',
+            'WindowsLocationOG',
+            'MacCoreLocation',
+            'LinuxGeoClue'
+        )
+
+        $learnableAccuracy = $false
+        if ($null -ne $selectedLocation.AccuracyMeters) {
+            try { $learnableAccuracy = ([double]$selectedLocation.AccuracyMeters -le 5000) } catch { }
+        }
+
+        if ([string]$selectedLocation.Method -in $learnableMethods -and $learnableAccuracy) {
+            $rfAnchorLearningResult = Update-LearnedBluetoothRfAnchors `
+                -Devices $bluetoothDevices `
+                -Location $selectedLocation
+
+            Write-Verbose ('RF anchor learning: status={0}; learned={1}; updated={2}; conflicts={3}; Candidate={4}; Probable={5}; Trusted={6}; migratedLegacy={7}; cache={8}.' -f
+                $rfAnchorLearningResult.Status,
+                $rfAnchorLearningResult.Learned,
+                $rfAnchorLearningResult.Updated,
+                $rfAnchorLearningResult.Conflicts,
+                $rfAnchorLearningResult.CandidateCount,
+                $rfAnchorLearningResult.ProbableCount,
+                $rfAnchorLearningResult.TrustedCount,
+                $rfAnchorLearningResult.MigratedFromLegacy,
+                $rfAnchorLearningResult.CachePath)
+        }
     }
 
     # Analyst-facing VPN values.
@@ -12304,6 +15077,8 @@ try {
     $bluetoothAnchorMapUri = New-GoogleMapsSearchUri -Location $bluetoothAnchorLocation
     $googleWifiMapUri      = New-GoogleMapsSearchUri -Location $googleWifiLocation
     $wigleMapUri           = New-GoogleMapsSearchUri -Location $wigleWifiLocation
+    $wigleBluetoothMapUri  = New-GoogleMapsSearchUri -Location $wigleBluetoothLocation
+    $underlayEgressMapUri = New-GoogleMapsSearchUri -Location $underlayStunGeo
     $nativeLocationMapUri  = New-GoogleMapsSearchUri -Location $nativeLocationCandidate
     $ogLocationMapUri      = New-GoogleMapsSearchUri -Location $ogLocationCandidate
     $publicIpMapUri        = New-GoogleMapsSearchUri -Location $publicIpLocation
@@ -12876,7 +15651,7 @@ try {
             -AnchorLocation $bluetoothAnchorLocation `
             -Status ([string]$bluetoothScan.Status) `
             -Detail ([string]$bluetoothScan.Detail) `
-            -ScanSeconds $effectiveBluetoothScanSeconds `
+            -ScanSeconds $bluetoothEvidenceScanSeconds `
             -MaxRows $(if ($FullEvidence) { 0 } else { 15 }) `
             -ForceStatusOutput:$bluetoothResultsForced
     }
@@ -12890,6 +15665,12 @@ try {
     }
 
     $wifiScanStatusOutput = if (
+        $platform -eq 'Windows' -and
+        $wifiScan.Status -eq 'BlockedBySystemLocation'
+    ) {
+        'BlockedBySystemLocation'
+    }
+    elseif (
         $platform -eq 'Windows' -and
         (
             $wifiScan.Status -eq 'BlockedByLocationPermission' -or
@@ -12946,8 +15727,11 @@ try {
             $wifiTable
         }
     }
+    elseif ($wifiScanStatusOutput -eq 'BlockedBySystemLocation') {
+        'Unavailable - Windows global/policy Location Services blocks programmatic BSSID enumeration.'
+    }
     elseif ($wifiScanStatusOutput -eq 'AccessDenied') {
-        'Unavailable - Windows location policy denied BSSID enumeration.'
+        'Unavailable - Windows location permission denied BSSID enumeration.'
     }
     else {
         'None'
@@ -12994,6 +15778,21 @@ try {
         0
     }
 
+    $windowsLocationEffectiveOutput = if ($platform -eq 'Windows') {
+        if ($windowsLocationSystemBlocked) {
+            [string]$windowsLocationAccessInitial.EffectiveState
+        }
+        elseif ($consentTemporarilyChanged) {
+            'AllowedViaTemporaryConsent'
+        }
+        else {
+            [string]$windowsLocationAccessInitial.EffectiveState
+        }
+    }
+    else {
+        'NotApplicable'
+    }
+
     $frameworkDescription = try {
         [System.Runtime.InteropServices.RuntimeInformation]::FrameworkDescription
     }
@@ -13034,9 +15833,13 @@ try {
         $(if ($null -eq $selectedLocation.AccuracyMeters) { '<unknown>' } else { $selectedLocation.AccuracyMeters }))
 
     if ($platform -eq 'Windows') {
-        Write-Verbose ('Windows location: service={0}; consent={1}; temporaryConsent={2}.' -f
+        Write-Verbose ('Windows location: service={0}; global={1}; policy={2}; user={3}; desktopApps={4}; effective={5}; temporaryConsent={6}.' -f
             $locationServiceState,
-            $(if ([string]::IsNullOrWhiteSpace([string]$initialConsent)) { '<unset>' } else { $initialConsent }),
+            $windowsLocationAccessInitial.GlobalState,
+            $windowsLocationAccessInitial.PolicyState,
+            $windowsLocationAccessInitial.UserConsent,
+            $windowsLocationAccessInitial.DesktopAppsConsent,
+            $windowsLocationEffectiveOutput,
             $consentTemporarilyChanged)
     }
 
@@ -13062,6 +15865,14 @@ try {
         $vpnAdapterDetected,
         $vpnTunnelEstablished,
         $(if ($vpnTunnelEstablished) { $establishedVpnTunnelOutput } else { $vpnAdapterDetectedOutput }))
+
+    Write-Verbose ('Topology: scenario={0}; class={1}; confidence={2}; RFmode={3}; RFstatus={4}; RFmethod={5}.' -f
+        $connectionScenario,
+        $connectionScenarioClass,
+        $connectionScenarioConfidence,
+        $rfLocationMode,
+        $rfFusionStatus,
+        $rfFusionMethod)
 
     Write-Verbose ('Network: interface={0}; type={1}; local={2}; gateway={3}; router={4}; WAN={5}.' -f
         $(if ($null -eq $routerWanDiscovery -or [string]::IsNullOrWhiteSpace([string]$routerWanDiscovery.InterfaceAlias)) { '<none>' } else { $routerWanDiscovery.InterfaceAlias }),
@@ -13107,6 +15918,12 @@ try {
         'MacCoreLocation'          { 'macOS Core Location fix.' }
         'LinuxGeoClue'             { 'Linux GeoClue fix.' }
         'WindowsVpnUnderlayTrace'  { 'VPN-resistant physical-location heuristic from the first public underlay ISP hop.' }
+        'WiGLEBluetoothCluster'     { 'Resolved from a clustered neighbourhood of independent public BLE observations.' }
+        'LearnedBluetoothRfCluster' { 'Resolved from a local cache of hashed BLE anchors learned during prior trustworthy physical-location fixes.' }
+        'UnderlayNetworkConsensus'  { 'Medium-confidence consensus from independent IPv6 and DNS-ECS physical-underlay locality evidence.' }
+        'UnderlayIPv6'              { 'Low-confidence global-IPv6 physical-underlay locality heuristic; VPN IPv4 egress excluded.' }
+        'UnderlayDnsEcs'            { 'Low-confidence local-DNS EDNS Client Subnet locality heuristic; VPN egress excluded.' }
+        'UnderlayEgressIP'          { 'Low-confidence physical-underlay ISP/carrier egress geolocation; VPN egress excluded.' }
         'PublicIP'                 { 'Public-IP fallback; coordinates represent Internet egress.' }
         'PhysicalLocationUnresolved' { 'Physical location unresolved; VPN egress is retained separately.' }
         default {
@@ -13380,10 +16197,67 @@ try {
         RouterVpnSuspected             = $routerVpnAssessment.Suspected
         RouterVpnConfidence            = $routerVpnAssessment.Confidence
         RouterVpnEvidence              = $routerVpnEvidenceOutput
+        TraceGeoSource                 = $traceGeoSource
         TraceGeo                       = $traceGeoFlat
 
         PhysicalVsPublicIpDistanceKm   = $distanceKm
         VpnOrRemoteEgressLikely        = [bool]$remoteEgressLikely
+
+        ConnectionScenario             = $connectionScenario
+        ConnectionScenarioClass        = $connectionScenarioClass
+        ConnectionScenarioConfidence   = $connectionScenarioConfidence
+        ConnectionScenarioBasis        = $connectionScenarioBasis
+        CellularGenerationEvidence     = $cellularGenerationEvidence
+
+        RfLocationMode                 = $rfLocationMode
+        RfLocationTrigger              = $rfLocationTrigger
+        RfFusionStatus                 = $rfFusionStatus
+        RfFusionMethod                 = $rfFusionMethod
+        RfFusionBleCandidateCount      = [int]$script:WigleBluetoothCandidateCount
+        RfFusionBleMatchedCount        = [int]$script:WigleBluetoothMatchCount
+        RfFusionBleClusterCount        = [int]$script:WigleBluetoothClusterCount
+        RfFusionBleClusterRadiusKm     = if ($null -ne $script:WigleBluetoothClusterRadiusKm) {
+                                             [double]$script:WigleBluetoothClusterRadiusKm
+                                         }
+                                         else {
+                                             'NotApplicable'
+                                         }
+        RfFusionWigleBluetoothStatus   = $wigleBluetoothResolverStatus
+        RfFusionWigleBluetoothQueries  = [int]$script:WigleBluetoothLiveQueriesUsed
+        RfLearnedAnchorStatus          = if ($DisableRfAnchorLearning) { 'DisabledByParameter' } elseif ($null -ne $learnedRfAnchorAssessment) { [string]$learnedRfAnchorAssessment.Status } else { 'NotRequired' }
+        RfLearnedAnchorMatchedCount    = if ($null -ne $learnedRfAnchorAssessment) { [int]$learnedRfAnchorAssessment.MatchCount } else { 0 }
+        RfLearnedAnchorCandidateCount  = if ($null -ne $learnedRfAnchorAssessment) { [int]$learnedRfAnchorAssessment.CandidateCount } elseif ($null -ne $rfAnchorLearningResult) { [int]$rfAnchorLearningResult.CandidateCount } else { 0 }
+        RfLearnedAnchorProbableCount   = if ($null -ne $learnedRfAnchorAssessment) { [int]$learnedRfAnchorAssessment.ProbableCount } elseif ($null -ne $rfAnchorLearningResult) { [int]$rfAnchorLearningResult.ProbableCount } else { 0 }
+        RfLearnedAnchorTrustedCount    = if ($null -ne $learnedRfAnchorAssessment) { [int]$learnedRfAnchorAssessment.TrustedCount } elseif ($null -ne $rfAnchorLearningResult) { [int]$rfAnchorLearningResult.TrustedCount } else { 0 }
+        RfLearnedAnchorScore           = if ($null -ne $learnedRfAnchorAssessment) { [int]$learnedRfAnchorAssessment.RfScore } else { 0 }
+        RfLearnedAnchorRequiredScore   = if ($null -ne $learnedRfAnchorAssessment) { [int]$learnedRfAnchorAssessment.RequiredRfScore } else { 7 }
+        RfLearnedAnchorRequiredTrusted = if ($null -ne $learnedRfAnchorAssessment) { [int]$learnedRfAnchorAssessment.RequiredTrustedCount } else { 2 }
+        RfLearnedAnchorClusterRadiusKm = if ($null -ne $learnedRfAnchorAssessment -and $null -ne $learnedRfAnchorAssessment.ClusterRadiusKm) { [double]$learnedRfAnchorAssessment.ClusterRadiusKm } else { 'NotApplicable' }
+        RfLearnedAnchorEvidence        = if ($null -ne $learnedRfAnchorAssessment) { [string]$learnedRfAnchorAssessment.EvidenceText } else { 'NotRequired' }
+        RfPhysicalEvidenceAge          = if ($null -ne $learnedRfAnchorAssessment) { [string]$learnedRfAnchorAssessment.EvidenceAge } else { 'NotAvailable' }
+        RfAnchorLastConfirmedUtc       = if ($null -ne $learnedRfAnchorAssessment) { [string]$learnedRfAnchorAssessment.LastConfirmedUtc } else { 'NotAvailable' }
+        RfLearnedAnchorCacheCount      = if ($null -ne $learnedRfAnchorAssessment) { [int]$learnedRfAnchorAssessment.CacheCount } elseif ($null -ne $rfAnchorLearningResult) { [int]$rfAnchorLearningResult.CacheCount } else { 0 }
+        RfAnchorCacheVersion           = if ($null -ne $learnedRfAnchorAssessment) { [int]$learnedRfAnchorAssessment.CacheVersion } elseif ($null -ne $rfAnchorLearningResult) { [int]$rfAnchorLearningResult.CacheVersion } else { 2 }
+        RfAnchorCacheMigratedFromLegacy = if ($null -ne $learnedRfAnchorAssessment) { [bool]$learnedRfAnchorAssessment.MigratedFromLegacy } elseif ($null -ne $rfAnchorLearningResult) { [bool]$rfAnchorLearningResult.MigratedFromLegacy } else { $false }
+        RfAnchorLearningStatus         = if ($DisableRfAnchorLearning) { 'DisabledByParameter' } elseif ($null -ne $rfAnchorLearningResult) { [string]$rfAnchorLearningResult.Status } else { 'NotEligibleThisRun' }
+        RfAnchorCachePath              = if ($null -ne $learnedRfAnchorAssessment) { [string]$learnedRfAnchorAssessment.CachePath } elseif ($null -ne $rfAnchorLearningResult) { [string]$rfAnchorLearningResult.CachePath } else { Get-RfAnchorCachePath }
+        UnderlayIpv6Status             = if ($null -ne $underlayIpv6Assessment) { [string]$underlayIpv6Assessment.Status } else { 'NotAttempted' }
+        UnderlayIpv6Address            = if ($null -ne $underlayIpv6Assessment -and -not [string]::IsNullOrWhiteSpace([string]$underlayIpv6Assessment.Address)) { [string]$underlayIpv6Assessment.Address } else { 'NotResolved' }
+        UnderlayIpv6PrefixLength       = if ($null -ne $underlayIpv6Assessment -and $null -ne $underlayIpv6Assessment.PrefixLength) { [int]$underlayIpv6Assessment.PrefixLength } else { 'NotApplicable' }
+        UnderlayIpv6GeoCity            = if ($null -ne $underlayIpv6Assessment -and $null -ne $underlayIpv6Assessment.ClientGeo -and -not [string]::IsNullOrWhiteSpace([string]$underlayIpv6Assessment.ClientGeo.City)) { [string]$underlayIpv6Assessment.ClientGeo.City } else { 'NotResolved' }
+        UnderlayIpv6GeoRegion          = if ($null -ne $underlayIpv6Assessment -and $null -ne $underlayIpv6Assessment.ClientGeo -and -not [string]::IsNullOrWhiteSpace([string]$underlayIpv6Assessment.ClientGeo.Region)) { [string]$underlayIpv6Assessment.ClientGeo.Region } else { 'NotResolved' }
+        UnderlayIpv6FirstGlobalHop     = if ($null -ne $underlayIpv6Assessment -and -not [string]::IsNullOrWhiteSpace([string]$underlayIpv6Assessment.FirstGlobalHop)) { [string]$underlayIpv6Assessment.FirstGlobalHop } else { 'NotResolved' }
+        UnderlayIpv6FirstGlobalHopCity = if ($null -ne $underlayIpv6Assessment -and $null -ne $underlayIpv6Assessment.FirstGlobalHopGeo -and -not [string]::IsNullOrWhiteSpace([string]$underlayIpv6Assessment.FirstGlobalHopGeo.City)) { [string]$underlayIpv6Assessment.FirstGlobalHopGeo.City } else { 'NotResolved' }
+        UnderlayIpv6TraceStatus        = if ($null -ne $underlayIpv6Assessment) { [string]$underlayIpv6Assessment.TraceStatus } else { 'NotAttempted' }
+        UnderlayIpv6Trace              = if ($null -ne $underlayIpv6Assessment -and @($underlayIpv6Assessment.TraceRows).Count -gt 0) { ((@($underlayIpv6Assessment.TraceRows) | Select-Object Hop, IP, Scope | Format-Table -AutoSize | Out-String -Width 4096).Trim()) } else { 'None' }
+        UnderlayDnsLocalityStatus      = if ($null -ne $underlayDnsAssessment) { [string]$underlayDnsAssessment.Status } else { 'NotAttempted' }
+        UnderlayDnsServers             = if ($null -ne $underlayDnsAssessment -and @($underlayDnsAssessment.DnsServers).Count -gt 0) { @($underlayDnsAssessment.DnsServers) -join ' > ' } else { 'NotResolved' }
+        UnderlayDnsEcsSubnet           = if ($null -ne $underlayDnsAssessment -and -not [string]::IsNullOrWhiteSpace([string]$underlayDnsAssessment.EcsSubnet)) { [string]$underlayDnsAssessment.EcsSubnet } else { 'NotResolved' }
+        UnderlayDnsEcsCity             = if ($null -ne $underlayDnsAssessment -and $null -ne $underlayDnsAssessment.EcsGeo -and -not [string]::IsNullOrWhiteSpace([string]$underlayDnsAssessment.EcsGeo.City)) { [string]$underlayDnsAssessment.EcsGeo.City } else { 'NotResolved' }
+        UnderlayDnsEcsRegion           = if ($null -ne $underlayDnsAssessment -and $null -ne $underlayDnsAssessment.EcsGeo -and -not [string]::IsNullOrWhiteSpace([string]$underlayDnsAssessment.EcsGeo.Region)) { [string]$underlayDnsAssessment.EcsGeo.Region } else { 'NotResolved' }
+        UnderlayDnsResolverPublicIp    = if ($null -ne $underlayDnsAssessment -and -not [string]::IsNullOrWhiteSpace([string]$underlayDnsAssessment.ResolverPublicIp)) { [string]$underlayDnsAssessment.ResolverPublicIp } else { 'NotResolved' }
+        UnderlayDnsResolverCity        = if ($null -ne $underlayDnsAssessment -and $null -ne $underlayDnsAssessment.ResolverGeo -and -not [string]::IsNullOrWhiteSpace([string]$underlayDnsAssessment.ResolverGeo.City)) { [string]$underlayDnsAssessment.ResolverGeo.City } else { 'NotResolved' }
+        UnderlayDnsTxtEvidence         = if ($null -ne $underlayDnsAssessment -and @($underlayDnsAssessment.TxtEvidence).Count -gt 0) { @($underlayDnsAssessment.TxtEvidence) -join ' | ' } else { 'None' }
         VpnAdapterDetected             = $vpnAdapterDetectedOutput
         EstablishedVpnTunnel           = $establishedVpnTunnelOutput
 
@@ -13398,6 +16272,8 @@ try {
         BluetoothAnchorMapUri          = if ([string]::IsNullOrWhiteSpace([string]$bluetoothAnchorMapUri)) { 'NotAvailable' } else { $bluetoothAnchorMapUri }
         GoogleWifiMapUri               = if ([string]::IsNullOrWhiteSpace([string]$googleWifiMapUri)) { 'NotAvailable' } else { $googleWifiMapUri }
         WigleMapUri                    = if ([string]::IsNullOrWhiteSpace([string]$wigleMapUri)) { 'NotAvailable' } else { $wigleMapUri }
+        WigleBluetoothMapUri           = if ([string]::IsNullOrWhiteSpace([string]$wigleBluetoothMapUri)) { 'NotAvailable' } else { $wigleBluetoothMapUri }
+        UnderlayEgressMapUri           = if ([string]::IsNullOrWhiteSpace([string]$underlayEgressMapUri)) { 'NotAvailable' } else { $underlayEgressMapUri }
         NativeLocationMapUri           = if ([string]::IsNullOrWhiteSpace([string]$nativeLocationMapUri)) { 'NotAvailable' } else { $nativeLocationMapUri }
         OgLocationMapUri               = if ([string]::IsNullOrWhiteSpace([string]$ogLocationMapUri)) { 'NotAvailable' } else { $ogLocationMapUri }
         PublicIpMapUri                 = if ([string]::IsNullOrWhiteSpace([string]$publicIpMapUri)) { 'NotAvailable' } else { $publicIpMapUri }
@@ -13407,6 +16283,17 @@ try {
         OG_and_NewG_gap                = if ([string]::IsNullOrWhiteSpace([string]$ogAndNewgGap)) { 'NotAvailable' } else { $ogAndNewgGap }
         Notes                          = $notesFlat
 
+    }
+
+    if ($platform -eq 'Windows') {
+        $result['WindowsLocationServiceState'] = if ([string]::IsNullOrWhiteSpace([string]$locationServiceState)) { 'Unknown' } else { [string]$locationServiceState }
+        $result['WindowsNativeLocationStatus'] = [string]$nativeLocationStatus
+        $result['WindowsLocationGlobalState'] = [string]$windowsLocationAccessInitial.GlobalState
+        $result['WindowsLocationPolicyState'] = [string]$windowsLocationAccessInitial.PolicyState
+        $result['WindowsLocationUserConsent'] = [string]$windowsLocationAccessInitial.UserConsent
+        $result['WindowsLocationDesktopAppsConsent'] = [string]$windowsLocationAccessInitial.DesktopAppsConsent
+        $result['WindowsLocationEffectiveState'] = $windowsLocationEffectiveOutput
+        $result['WindowsLocationTemporaryConsentUsed'] = [bool]$consentTemporarilyChanged
     }
 
     # Windows-only analyst-facing underlay diagnostics. Keep Linux/macOS output
@@ -13428,6 +16315,111 @@ try {
         }
 
         $result['PublicIpRole'] = 'VpnEgressOnly'
+        $result['UnderlayPublicIpProbeStatus'] = if ($DisableUnderlayStunProbe) {
+            'DisabledByParameter'
+        }
+        elseif ($null -ne $underlayStunAssessment) {
+            [string]$underlayStunAssessment.Status
+        }
+        elseif ($windowsEndpointVpnEstablished -and $windowsVpnUnderlayTransport -eq 'WiFi' -and $null -eq $physicalLocation) {
+            'NotAttempted'
+        }
+        else {
+            'NotRequired'
+        }
+        $result['UnderlayPublicIpProbeStage'] = if ($null -ne $underlayStunAssessment) {
+            [string]$underlayStunAssessment.Stage
+        }
+        else {
+            'NotAttempted'
+        }
+        $result['UnderlayPublicIpProbeServer'] = if (
+            $null -ne $underlayStunAssessment -and
+            -not [string]::IsNullOrWhiteSpace([string]$underlayStunAssessment.Server)
+        ) {
+            [string]$underlayStunAssessment.Server
+        }
+        else {
+            'NotResolved'
+        }
+        $result['UnderlayPublicIpProbeInterfacePinApplied'] = if ($null -ne $underlayStunAssessment) {
+            [bool]$underlayStunAssessment.InterfacePinApplied
+        }
+        else {
+            $false
+        }
+        $result['UnderlayPublicIpProbeInterfacePinMethod'] = if (
+            $null -ne $underlayStunAssessment -and
+            -not [string]::IsNullOrWhiteSpace([string]$underlayStunAssessment.InterfacePinMethod)
+        ) {
+            [string]$underlayStunAssessment.InterfacePinMethod
+        }
+        else {
+            'NotAttempted'
+        }
+        $result['UnderlayPublicIpProbeLocalSocket'] = if (
+            $null -ne $underlayStunAssessment -and
+            -not [string]::IsNullOrWhiteSpace([string]$underlayStunAssessment.LocalSocketEndpoint)
+        ) {
+            [string]$underlayStunAssessment.LocalSocketEndpoint
+        }
+        else {
+            'NotResolved'
+        }
+        $result['UnderlayPublicIpProbeError'] = if (
+            $null -ne $underlayStunAssessment -and
+            -not [string]::IsNullOrWhiteSpace([string]$underlayStunAssessment.Error)
+        ) {
+            [string]$underlayStunAssessment.Error
+        }
+        else {
+            'None'
+        }
+        $result['UnderlayPublicIp'] = if (
+            $null -ne $underlayStunAssessment -and
+            -not [string]::IsNullOrWhiteSpace([string]$underlayStunAssessment.PublicIPAddress)
+        ) {
+            [string]$underlayStunAssessment.PublicIPAddress
+        }
+        else {
+            'NotResolved'
+        }
+        $result['UnderlayPublicIpRole'] = if (
+            $null -ne $underlayStunAssessment -and
+            $underlayStunAssessment.Status -eq 'Resolved'
+        ) {
+            if ($connectionScenarioClass -eq 'VPNoverCellularHotspot') { 'CarrierEgress' } else { 'PhysicalUnderlayEgress' }
+        }
+        else {
+            'NotResolved'
+        }
+        $result['UnderlayPublicIpCity'] = if (
+            $null -ne $underlayStunGeo -and
+            -not [string]::IsNullOrWhiteSpace([string]$underlayStunGeo.City)
+        ) {
+            [string]$underlayStunGeo.City
+        }
+        else {
+            'NotResolved'
+        }
+        $result['UnderlayPublicIpRegion'] = if (
+            $null -ne $underlayStunGeo -and
+            -not [string]::IsNullOrWhiteSpace([string]$underlayStunGeo.Region)
+        ) {
+            [string]$underlayStunGeo.Region
+        }
+        else {
+            'NotResolved'
+        }
+        $result['UnderlayPublicIpIsp'] = if (
+            $null -ne $underlayStunGeo -and
+            -not [string]::IsNullOrWhiteSpace([string]$underlayStunGeo.ISP)
+        ) {
+            [string]$underlayStunGeo.ISP
+        }
+        else {
+            'NotResolved'
+        }
         $result['WindowsVpnUnderlayStatus'] = if ($null -ne $windowsVpnUnderlayAssessment) {
             [string]$windowsVpnUnderlayAssessment.Status
         }
@@ -13451,6 +16443,33 @@ try {
         }
         else {
             'NotResolved'
+        }
+        $result['WindowsVpnUnderlayBindingSource'] = if (
+            $null -ne $windowsVpnUnderlayAssessment -and
+            -not [string]::IsNullOrWhiteSpace([string]$windowsVpnUnderlayAssessment.BindingSource)
+        ) {
+            [string]$windowsVpnUnderlayAssessment.BindingSource
+        }
+        else {
+            'NotResolved'
+        }
+        $result['WindowsVpnUnderlayLocalIp'] = if (
+            $null -ne $windowsVpnUnderlayAssessment -and
+            -not [string]::IsNullOrWhiteSpace([string]$windowsVpnUnderlayAssessment.LocalIPAddress)
+        ) {
+            [string]$windowsVpnUnderlayAssessment.LocalIPAddress
+        }
+        else {
+            'NotResolved'
+        }
+        $result['WindowsVpnUnderlayTraceMethod'] = if (
+            $null -ne $windowsVpnUnderlayAssessment -and
+            -not [string]::IsNullOrWhiteSpace([string]$windowsVpnUnderlayAssessment.TraceMethod)
+        ) {
+            [string]$windowsVpnUnderlayAssessment.TraceMethod
+        }
+        else {
+            'NotObserved'
         }
         $result['WindowsVpnUnderlayInterface'] = if (
             $null -ne $windowsVpnUnderlayAssessment -and
@@ -13506,14 +16525,96 @@ try {
         else {
             'NotResolved'
         }
-        $result['WindowsVpnUnderlayNearestMajorCity'] = if ($null -ne $localCanadianCity) {
-            [string]$localCanadianCity.City
+        $result['WindowsVpnUnderlayNearestMajorCity'] = if ($null -ne $windowsVpnUnderlayNearestMajorCity) {
+            [string]$windowsVpnUnderlayNearestMajorCity.City
         }
         else {
             'NotResolved'
         }
-        $result['WindowsVpnUnderlayNearestMajorCityDistanceKm'] = if ($null -ne $localCanadianCity) {
-            [double]$localCanadianCity.DistanceFromCenterKm
+        $result['WindowsVpnUnderlayNearestMajorCityDistanceKm'] = if ($null -ne $windowsVpnUnderlayNearestMajorCity) {
+            [double]$windowsVpnUnderlayNearestMajorCity.DistanceFromCenterKm
+        }
+        else {
+            'NotApplicable'
+        }
+        $result['WindowsVpnUnderlayRole'] = if (
+            $null -ne $windowsVpnUnderlayAssessment -and
+            $windowsVpnUnderlayAssessment.Status -eq 'Resolved' -and
+            $selectedLocation.Method -eq 'WindowsVpnUnderlayTrace'
+        ) {
+            'FallbackLocationHeuristic'
+        }
+        elseif (
+            $null -ne $windowsVpnUnderlayAssessment -and
+            (
+                @($windowsVpnUnderlayAssessment.TraceGeo).Count -gt 0 -or
+                $windowsVpnUnderlayAssessment.Status -eq 'ResolvedFromEstablishedSocket'
+            )
+        ) {
+            'NetworkPathContext'
+        }
+        else {
+            'NotResolved'
+        }
+        $result['WindowsVpnUnderlayTransport'] = if (
+            $null -ne $windowsVpnUnderlayAssessment -and
+            -not [string]::IsNullOrWhiteSpace([string]$windowsVpnUnderlayAssessment.InterfaceAlias)
+        ) {
+            if (
+                $null -ne $routerWanDiscovery -and
+                [string]$routerWanDiscovery.InterfaceAlias -eq [string]$windowsVpnUnderlayAssessment.InterfaceAlias -and
+                -not [string]::IsNullOrWhiteSpace([string]$routerWanDiscovery.InterfaceType)
+            ) {
+                [string]$routerWanDiscovery.InterfaceType
+            }
+            else {
+                'Unknown'
+            }
+        }
+        else {
+            'NotResolved'
+        }
+        $result['WindowsVpnUnderlayCarrierNatDetected'] = if ($null -ne $windowsVpnUnderlayAssessment) {
+            [bool]$windowsVpnUnderlayAssessment.CarrierNatDetected
+        }
+        else {
+            $false
+        }
+        $result['WindowsVpnUnderlayCarrierNatHopCount'] = if ($null -ne $windowsVpnUnderlayAssessment) {
+            [int]$windowsVpnUnderlayAssessment.CarrierNatHopCount
+        }
+        else {
+            0
+        }
+        $result['WindowsVpnUnderlayPathClass'] = if (
+            $null -ne $windowsVpnUnderlayAssessment -and
+            -not [string]::IsNullOrWhiteSpace([string]$windowsVpnUnderlayAssessment.PathClass)
+        ) {
+            [string]$windowsVpnUnderlayAssessment.PathClass
+        }
+        else {
+            'NotObserved'
+        }
+        $result['WindowsVpnUnderlayUpstreamClass'] = if (
+            $null -ne $windowsVpnUnderlayAssessment -and
+            -not [string]::IsNullOrWhiteSpace([string]$windowsVpnUnderlayAssessment.UpstreamClass)
+        ) {
+            [string]$windowsVpnUnderlayAssessment.UpstreamClass
+        }
+        else {
+            'Unknown'
+        }
+        $result['WindowsVpnUnderlayGeoMeaning'] = if (
+            $null -ne $windowsVpnUnderlayAssessment -and
+            $windowsVpnUnderlayAssessment.Status -eq 'Resolved'
+        ) {
+            'CarrierOrISPPathGeo; may represent a network POP rather than device position'
+        }
+        elseif (
+            $null -ne $windowsVpnUnderlayAssessment -and
+            $windowsVpnUnderlayAssessment.CarrierNatDetected
+        ) {
+            'CarrierNAT path observed; no public geolocatable hop was required to classify the upstream path'
         }
         else {
             'NotApplicable'
